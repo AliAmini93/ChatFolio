@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ChatFolio</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <main class="app-shell">
+    <header class="app-header">
+      <div class="brand-mark">
+        <img src="icons/icon48.png" alt="" />
+      </div>
+      <div class="brand-copy">
+        <div class="brand-line">
+          <h1>ChatFolio</h1>
+          <span class="version-pill">v1.0.0</span>
+        </div>
+        <p>Export AI conversations to PDF</p>
+      </div>
+    </header>
+
+    <section class="platform-card" aria-label="Detected platform">
+      <div>
+        <span class="eyebrow">Active chat</span>
+        <strong id="platformName">Detecting platform…</strong>
+      </div>
+      <span id="platformBadge" class="platform-badge">Detecting…</span>
+    </section>
+
+    <section class="panel appearance-panel">
+      <div class="section-heading">
+        <div>
+          <span class="eyebrow">Appearance</span>
+          <h2>Theme</h2>
+        </div>
+      </div>
+      <div class="theme-picker" role="radiogroup" aria-label="Popup theme">
+        <button class="theme-choice" type="button" data-theme-choice="light" aria-pressed="true">
+          <span class="theme-swatch light-swatch"></span>
+          <span>Light</span>
+        </button>
+        <button class="theme-choice" type="button" data-theme-choice="graphite" aria-pressed="false">
+          <span class="theme-swatch graphite-swatch"></span>
+          <span>Graphite</span>
+        </button>
+        <button class="theme-choice" type="button" data-theme-choice="dark" aria-pressed="false">
+          <span class="theme-swatch dark-swatch"></span>
+          <span>Dark</span>
+        </button>
+      </div>
+    </section>
+
+    <section class="panel settings-panel">
+      <div class="section-heading compact-heading">
+        <div>
+          <span class="eyebrow">PDF settings</span>
+          <h2>Reading preferences</h2>
+        </div>
+      </div>
+
+      <label class="select-row">
+        <span>
+          <strong>Reading density</strong>
+          <small>Comfortable gives the text more breathing room.</small>
+        </span>
+        <select id="layoutMode">
+          <option value="comfortable">Comfortable</option>
+          <option value="compact">Compact</option>
+        </select>
+      </label>
+
+      <div class="toggle-stack">
+        <label class="toggle-row">
+          <span>
+            <strong>Message numbers</strong>
+            <small>Show turn numbers beside each speaker.</small>
+          </span>
+          <input id="showMessageNumbers" class="toggle-input" type="checkbox" checked />
+          <span class="toggle-ui" aria-hidden="true"></span>
+        </label>
+
+        <label class="toggle-row">
+          <span>
+            <strong>Conversation images</strong>
+            <small>Embed screenshots and meaningful images in the PDF.</small>
+          </span>
+          <input id="embedImages" class="toggle-input" type="checkbox" checked />
+          <span class="toggle-ui" aria-hidden="true"></span>
+        </label>
+
+        <label class="toggle-row">
+          <span>
+            <strong>Export timestamp</strong>
+            <small>Add the export date and time to the document header.</small>
+          </span>
+          <input id="includeTimestamps" class="toggle-input" type="checkbox" />
+          <span class="toggle-ui" aria-hidden="true"></span>
+        </label>
+      </div>
+    </section>
+
+    <div class="action-row">
+      <button id="exportBtn" class="primary-button" type="button">
+        <span class="button-icon" aria-hidden="true">↗</span>
+        <span>Export full chat</span>
+      </button>
+      <button id="stopBtn" class="stop-button" type="button" hidden>
+        <span aria-hidden="true">■</span>
+        <span>Stop scan</span>
+      </button>
+    </div>
+
+    <section id="progressWrap" class="progress-card" hidden>
+      <div class="progress-head">
+        <span class="live-dot" aria-hidden="true"></span>
+        <strong>Conversation scan</strong>
+        <span id="progressPercent">0%</span>
+      </div>
+      <div class="progress-track" aria-hidden="true">
+        <div id="progressBar" class="progress-bar"></div>
+      </div>
+      <div class="stats">
+        <span id="messageCount">0 messages</span>
+        <span id="imageCount">0 media</span>
+      </div>
+    </section>
+
+    <section class="status-card">
+      <span class="status-icon" aria-hidden="true">i</span>
+      <p id="status" role="status">Detecting the active AI chat…</p>
+    </section>
+
+    <footer>
+      <span>Tip: disable <strong>Chrome → Headers and footers</strong> to remove browser-added page headers and footers.</span>
+      <span class="support-line">ChatGPT · Claude · Gemini</span>
+    </footer>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

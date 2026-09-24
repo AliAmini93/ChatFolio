@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "ChatFolio - AI Chat to PDF",
+  "version": "1.0.0",
+  "description": "Export ChatGPT, Claude, and Gemini conversations to PDF with multilingual layout, media handling, and scan controls.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "tabs",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://claude.ai/*",
+    "https://gemini.google.com/*",
+    "https://*.oaiusercontent.com/*",
+    "https://*.oaistatic.com/*",
+    "https://*.anthropic.com/*",
+    "https://*.googleusercontent.com/*",
+    "https://*.gstatic.com/*"
+  ],
+  "action": {
+    "default_title": "ChatFolio - Export AI chat to PDF",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}
