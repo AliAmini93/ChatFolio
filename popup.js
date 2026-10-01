@@ -1,4 +1,5 @@
 const exportBtn = document.getElementById("exportBtn");
+const visualBtn = document.getElementById("visualBtn");
 const stopBtn = document.getElementById("stopBtn");
 const statusEl = document.getElementById("status");
 const platformBadge = document.getElementById("platformBadge");
@@ -8,12 +9,12 @@ const progressWrap = document.getElementById("progressWrap");
 const layoutMode = document.getElementById("layoutMode");
 const showMessageNumbers = document.getElementById("showMessageNumbers");
 const progressBar = document.getElementById("progressBar");
-const messageCountEl = document.getElementById("messageCount");
-const imageCountEl = document.getElementById("imageCount");
-const progressPercentEl = document.getElementById("progressPercent");
 const platformNameEl = document.getElementById("platformName");
 const themeButtons = [...document.querySelectorAll("[data-theme-choice]")];
+const versionPill = document.getElementById("versionPill");
 
+const EXTENSION_VERSION = chrome.runtime.getManifest().version;
+if (versionPill) versionPill.textContent = `v${EXTENSION_VERSION}`;
 const PREFS_KEY = "chatfolioPreferencesV1";
 const DEFAULT_PREFS = {
   theme: "light",
@@ -90,10 +91,12 @@ function setPlatformUi(platform) {
     if (!runningExportTabId) statusEl.textContent = "Open a ChatGPT, Claude, or Gemini conversation to export it.";
   }
   exportBtn.disabled = Boolean(runningExportTabId) || !platform;
+  if (visualBtn) visualBtn.disabled = Boolean(runningExportTabId) || !platform;
 }
 
 function setRunningUi(running) {
   exportBtn.disabled = running || !activePlatform;
+  if (visualBtn) visualBtn.disabled = running || !activePlatform;
   stopBtn.hidden = !running;
   stopBtn.disabled = !running || stopRequested;
   layoutMode.disabled = running;
@@ -106,10 +109,9 @@ function applyProgress(message) {
   progressWrap.hidden = false;
   const percent = Math.max(0, Math.min(100, Number(message.percent) || 0));
   progressBar.style.width = `${percent}%`;
-  if (progressPercentEl) progressPercentEl.textContent = `${Math.round(percent)}%`;
-  if (Number.isFinite(message.messageCount)) messageCountEl.textContent = `${message.messageCount} messages`;
-  if (Number.isFinite(message.imageCount)) imageCountEl.textContent = `${message.imageCount} media`;
-  if (message.status) statusEl.textContent = message.status;
+  // Keep the running UI intentionally simple: the progress bar is the only
+  // live progress indicator. Detailed counts remain internal diagnostics.
+  if (message.running === true) statusEl.textContent = "Exporting conversation…";
 }
 
 chrome.runtime.onMessage.addListener((message, sender) => {
@@ -151,9 +153,9 @@ async function pingContentScript(tabId) {
   return chrome.tabs.sendMessage(tabId, { type: "CHATFOLIO_PING" });
 }
 
-async function sendExportMessage(tabId) {
+async function sendExportMessage(tabId, { forceVisual = false } = {}) {
   return chrome.tabs.sendMessage(tabId, {
-    type: "EXPORT_CHATFOLIO_PDF",
+    type: forceVisual ? "EXPORT_CHATFOLIO_VISUAL_PDF" : "EXPORT_CHATFOLIO_PDF",
     includeExportTime: includeTimestamps.checked,
     embedImages: embedImages.checked,
     layoutMode: layoutMode.value,
@@ -161,23 +163,58 @@ async function sendExportMessage(tabId) {
   });
 }
 
+function waitForTabComplete(tabId, timeoutMs = 12000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => finish(new Error("The chat tab did not finish reloading in time.")), timeoutMs);
+
+    function finish(error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      if (error) reject(error);
+      else resolve();
+    }
+
+    function onUpdated(updatedTabId, changeInfo) {
+      if (updatedTabId === tabId && changeInfo.status === "complete") finish();
+    }
+
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.get(tabId).then((tab) => {
+      if (tab?.status === "complete") finish();
+    }).catch((error) => finish(error));
+  });
+}
+
 async function ensureContentScript(tabId, platform) {
+  let pong = null;
   try {
-    const pong = await pingContentScript(tabId);
-    if (pong?.ok && pong?.platform === platform.id) return pong;
+    pong = await pingContentScript(tabId);
+    if (pong?.ok && pong?.platform === platform.id && pong?.version === EXTENSION_VERSION) return pong;
   } catch (error) {
     if (!isMissingReceiverError(error)) throw error;
+  }
+
+  // A tab can keep an injected worker from an older ChatFolio build after the
+  // extension is updated. Never stack two message listeners on the same page.
+  // Reload once so the new worker starts against the current provider DOM.
+  if (pong?.ok && pong?.version && pong.version !== EXTENSION_VERSION) {
+    statusEl.textContent = `ChatFolio was updated. Refreshing the ${platform.name} tab once…`;
+    await chrome.tabs.reload(tabId);
+    await waitForTabComplete(tabId);
   }
 
   statusEl.textContent = `Connecting ChatFolio to ${platform.name}…`;
   await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
 
   let lastError = null;
-  for (const waitMs of [0, 60, 150, 300]) {
+  for (const waitMs of [0, 80, 180, 360, 700]) {
     if (waitMs) await delay(waitMs);
     try {
-      const pong = await pingContentScript(tabId);
-      if (pong?.ok && pong?.platform === platform.id) return pong;
+      const nextPong = await pingContentScript(tabId);
+      if (nextPong?.ok && nextPong?.platform === platform.id && nextPong?.version === EXTENSION_VERSION) return nextPong;
     } catch (error) {
       lastError = error;
       if (!isMissingReceiverError(error)) throw error;
@@ -238,13 +275,10 @@ async function syncRunningState() {
   }
 }
 
-exportBtn.addEventListener("click", async () => {
+async function startExport({ forceVisual = false } = {}) {
   stopRequested = false;
   progressWrap.hidden = false;
   progressBar.style.width = "2%";
-  if (progressPercentEl) progressPercentEl.textContent = "2%";
-  messageCountEl.textContent = "0 messages";
-  imageCountEl.textContent = "0 media";
 
   try {
     const existing = await getGlobalState();
@@ -257,13 +291,15 @@ exportBtn.addEventListener("click", async () => {
     setRunningUi(true);
     runningExportTabId = tab.id;
     runningExportPlatformName = platform.name;
-    statusEl.textContent = `Preparing a full ${platform.name} conversation scan…`;
+    statusEl.textContent = forceVisual
+      ? `Preparing a visual backup of the ${platform.name} conversation…`
+      : `Preparing the ${platform.name} conversation export…`;
     await ensureContentScript(tab.id, platform);
-    const response = await sendExportMessage(tab.id);
+    const response = await sendExportMessage(tab.id, { forceVisual });
 
     if (!response?.ok) {
       if (response?.cancelled) {
-        statusEl.textContent = "Scan stopped. Your original scroll position was restored. No PDF was created.";
+        statusEl.textContent = "Export stopped. No PDF was created.";
         progressBar.style.width = "0%";
         return;
       }
@@ -271,29 +307,30 @@ exportBtn.addEventListener("click", async () => {
     }
 
     progressBar.style.width = "100%";
-    if (progressPercentEl) progressPercentEl.textContent = "100%";
-    messageCountEl.textContent = `${response.messageCount} messages`;
-    imageCountEl.textContent = `${response.imageCount} media`;
-    statusEl.textContent = `Full ${response.platformName || platform.name} scan complete. ${response.messageCount} messages collected. Print dialog opened.`;
+    statusEl.textContent = response.fallbackMode === "visual"
+      ? `${response.platformName || platform.name} visual archive ready. Print view opened.`
+      : `${response.platformName || platform.name} conversation ready. Print view opened.`;
   } catch (error) {
     statusEl.textContent = error?.message || String(error);
     progressBar.style.width = "0%";
-    if (progressPercentEl) progressPercentEl.textContent = "0%";
   } finally {
     runningExportTabId = null;
     runningExportPlatformName = null;
     stopRequested = false;
     setRunningUi(false);
   }
-});
+}
+
+exportBtn.addEventListener("click", () => startExport({ forceVisual: false }));
+if (visualBtn) visualBtn.addEventListener("click", () => startExport({ forceVisual: true }));
 
 stopBtn.addEventListener("click", async () => {
   if (stopRequested) return;
   stopRequested = true;
   stopBtn.disabled = true;
   statusEl.textContent = runningExportPlatformName
-    ? `Stopping the ${runningExportPlatformName} scan and restoring its position…`
-    : "Stopping scan and restoring the original position…";
+    ? `Stopping the ${runningExportPlatformName} export…`
+    : "Stopping export…";
 
   try {
     let response = await chrome.runtime.sendMessage({ type: "STOP_GLOBAL_CHATFOLIO_EXPORT" });
@@ -306,10 +343,10 @@ stopBtn.addEventListener("click", async () => {
       runningExportPlatformName = null;
       stopRequested = false;
       setRunningUi(false);
-      statusEl.textContent = "No active scan is running.";
+      statusEl.textContent = "No active export is running.";
       return;
     }
-    statusEl.textContent = "Stop requested. Waiting for the source tab to restore its original position…";
+    statusEl.textContent = "Stop requested. Waiting for the export to end…";
   } catch (error) {
     stopRequested = false;
     stopBtn.disabled = false;

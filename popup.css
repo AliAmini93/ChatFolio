@@ -241,6 +241,7 @@ select:focus { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)
 
 .action-row { display: flex; gap: 8px; margin: 4px 0 11px; }
 .primary-button,
+.visual-button,
 .stop-button {
   border: 0;
   border-radius: 13px;
@@ -255,8 +256,9 @@ select:focus { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)
   transition: transform 120ms ease, filter 120ms ease, opacity 120ms ease;
 }
 .primary-button { flex: 1; color: #fff; background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent-2) 84%, var(--accent))); box-shadow: 0 8px 22px color-mix(in srgb, var(--accent) 24%, transparent); }
-.primary-button:hover:not(:disabled), .stop-button:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.03); }
-.primary-button:disabled, .stop-button:disabled { opacity: .52; cursor: default; transform: none; }
+.primary-button:hover:not(:disabled), .visual-button:hover:not(:disabled), .stop-button:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.03); }
+.primary-button:disabled, .visual-button:disabled, .stop-button:disabled { opacity: .52; cursor: default; transform: none; }
+.visual-button { flex: 0 0 auto; min-width: 112px; color: var(--ink); background: var(--surface); border: 1px solid var(--border); box-shadow: none; }
 .stop-button { width: 116px; color: #fff; background: linear-gradient(135deg, #c33d33, #9f2b25); }
 .button-icon { font-size: 15px; line-height: 1; }
 
@@ -284,3 +286,13 @@ footer { display: flex; flex-direction: column; gap: 3px; padding: 9px 3px 0; co
 .support-line { opacity: .72; }
 
 [hidden] { display: none !important; }
+
+/* v1.5: the progress card is intentionally just a progress bar. Counts and
+   percentages remain internal diagnostics but are not shown in the popup. */
+.progress-card .progress-head,
+.progress-card .stats {
+  display: none !important;
+}
+.progress-card .progress-track {
+  margin: 0;
+}

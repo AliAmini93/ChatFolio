@@ -30,3 +30,8 @@ English (primary listing)
 - No ChatFolio analytics or advertising service is used.
 - Local extension settings are stored in Chrome storage.
 - Provider-hosted images may be fetched when image embedding is enabled.
+
+
+Resilience
+- Automatic visual archive fallback when provider layout/data changes prevent normal extraction
+- The fallback scrolls and captures the conversation without relying on message selectors

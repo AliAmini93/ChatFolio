@@ -5,12 +5,71 @@
   // exist" loop on an already-open tab.
   let exportInProgress = false;
   let activeExport = null;
+  const EXTENSION_VERSION = (() => {
+    try { return chrome.runtime.getManifest()?.version || "unknown"; } catch { return "unknown"; }
+  })();
   const PLATFORM = detectPlatform();
   const ADAPTER = createPlatformAdapter(PLATFORM);
+  const chatGPTAssetUrlCache = new Map();
+
+
+  function clampNumber(value, min, max) {
+    return Math.max(min, Math.min(max, Number(value) || min));
+  }
+
+  function adaptiveIoConcurrency() {
+    // Network/media resolution benefits from concurrency, but provider APIs can
+    // rate-limit aggressive bursts. Scale conservatively with the machine and
+    // connection rather than creating one worker per CPU core.
+    const cores = clampNumber(navigator.hardwareConcurrency || 4, 1, 32);
+    const memory = clampNumber(navigator.deviceMemory || 4, 1, 32);
+    const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection || null;
+    const effectiveType = String(connection?.effectiveType || '').toLowerCase();
+
+    let workers = cores >= 12 ? 4 : (cores >= 6 ? 3 : 2);
+    if (memory <= 2) workers = Math.min(workers, 2);
+    if (connection?.saveData || effectiveType === 'slow-2g' || effectiveType === '2g') workers = 1;
+    else if (effectiveType === '3g') workers = Math.min(workers, 2);
+    return clampNumber(workers, 1, 4);
+  }
+
+  function adaptiveTransferConcurrency() {
+    const cores = clampNumber(navigator.hardwareConcurrency || 4, 1, 32);
+    const memory = clampNumber(navigator.deviceMemory || 4, 1, 32);
+    let workers = cores >= 12 ? 6 : (cores >= 8 ? 5 : (cores >= 4 ? 4 : 2));
+    if (memory <= 2) workers = Math.min(workers, 2);
+    else if (memory <= 4) workers = Math.min(workers, 4);
+    return clampNumber(workers, 2, 6);
+  }
+
+  async function mapWithConcurrency(items, worker, { concurrency = 2, signal = null, onSettled = null } = {}) {
+    const list = Array.from(items || []);
+    if (!list.length) return [];
+    const results = new Array(list.length);
+    let cursor = 0;
+    let settled = 0;
+    const runnerCount = Math.max(1, Math.min(list.length, Math.floor(concurrency) || 1));
+
+    const runner = async () => {
+      while (true) {
+        if (signal?.aborted) throw makeCancelledError();
+        const index = cursor;
+        cursor += 1;
+        if (index >= list.length) return;
+        const result = await worker(list[index], index);
+        results[index] = result;
+        settled += 1;
+        if (onSettled) onSettled(result, index, settled, list.length);
+      }
+    };
+
+    await Promise.all(Array.from({ length: runnerCount }, () => runner()));
+    return results;
+  }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "CHATFOLIO_PING") {
-      sendResponse({ ok: true, version: "0.8.0", platform: PLATFORM.id, platformName: PLATFORM.name });
+      sendResponse({ ok: true, version: EXTENSION_VERSION, platform: PLATFORM.id, platformName: PLATFORM.name });
       return;
     }
 
@@ -46,7 +105,7 @@
       return;
     }
 
-    if (message?.type !== "EXPORT_CHATFOLIO_PDF") return;
+    if (!["EXPORT_CHATFOLIO_PDF", "EXPORT_CHATFOLIO_VISUAL_PDF"].includes(message?.type)) return;
 
     if (exportInProgress) {
       sendResponse({ ok: false, error: "An export is already running in this tab." });
@@ -81,7 +140,8 @@
       includeExportTime: Boolean(message.includeExportTime),
       embedImages: message.embedImages !== false,
       layoutMode: message.layoutMode === "compact" ? "compact" : "comfortable",
-      showMessageNumbers: message.showMessageNumbers !== false
+      showMessageNumbers: message.showMessageNumbers !== false,
+      forceVisual: message.type === "EXPORT_CHATFOLIO_VISUAL_PDF"
     }, activeExport)
       .then((result) => sendResponse({ ok: true, ...result }))
       .catch((error) => {
@@ -126,76 +186,308 @@
   }
 
   function createPlatformAdapter(platform) {
-    if (platform.id === "claude") {
+    const outsideUiChrome = (node) => !node.closest?.('nav, aside, [role="dialog"], [role="menu"], [role="listbox"]');
+
+    if (platform.id === "chatgpt") {
+      const roleSelector = [
+        '[data-message-author-role="user"]',
+        '[data-message-author-role="assistant"]',
+        '[data-role="user"]',
+        '[data-role="assistant"]',
+        '[data-message-author="user"]',
+        '[data-message-author="assistant"]'
+      ].join(', ');
+
+      const legacyTurnSelector = [
+        'section[data-turn="user"]',
+        'section[data-turn="assistant"]',
+        'article[data-turn="user"]',
+        'article[data-turn="assistant"]',
+        '[data-testid^="conversation-turn-"]',
+        '[data-testid*="conversation-turn"]',
+        '.user-turn',
+        '.agent-turn'
+      ].join(', ');
+
+      // ChatGPT's 2026 grouped renderer puts a user prompt and its assistant
+      // response under the same stable [data-turn-key] group. The old role/data-turn
+      // attributes can be completely absent in this rollout, so collect the two
+      // authored surfaces separately instead of treating the whole group as one turn.
+      const groupedTurnSelector = '[data-turn-key]';
+      const groupedUserSelector = '[data-user-message-bubble]';
+      const groupedAssistantSelector = '[data-conversation-role="assistant"]';
+      const groupedAssistantStartSelector = '[data-chatgpt-agent-turn-start]';
+
+      function inferRole(node) {
+        if (!node) return "unknown";
+
+        const direct = node.getAttribute?.('data-message-author-role')
+          || node.getAttribute?.('data-role')
+          || node.getAttribute?.('data-message-author')
+          || node.getAttribute?.('data-turn')
+          || node.getAttribute?.('data-conversation-role');
+        if (direct === 'user' || direct === 'assistant') return direct;
+
+        if (node.matches?.(groupedUserSelector) || node.closest?.(groupedUserSelector)) return 'user';
+        if (node.matches?.(groupedAssistantSelector) || node.closest?.(groupedAssistantSelector)) return 'assistant';
+        if (node.matches?.(groupedAssistantStartSelector) || node.closest?.(groupedAssistantStartSelector)) return 'assistant';
+        const nestedGroupedUser = Boolean(node.querySelector?.(groupedUserSelector));
+        const nestedGroupedAssistant = Boolean(node.querySelector?.(`${groupedAssistantSelector}, ${groupedAssistantStartSelector}`));
+        if (nestedGroupedAssistant && !nestedGroupedUser) return 'assistant';
+        if (nestedGroupedUser && !nestedGroupedAssistant) return 'user';
+
+        const nested = node.querySelector?.(roleSelector);
+        const nestedRole = nested?.getAttribute?.('data-message-author-role')
+          || nested?.getAttribute?.('data-role')
+          || nested?.getAttribute?.('data-message-author');
+        if (nestedRole === 'user' || nestedRole === 'assistant') return nestedRole;
+
+        // Do not assign a role to a grouped [data-turn-key] wrapper when it contains
+        // both roles. Doing so would merge a prompt and response into one PDF message.
+        if (node.matches?.(groupedTurnSelector)) {
+          const hasUser = Boolean(node.querySelector?.(groupedUserSelector));
+          const hasAssistant = Boolean(node.querySelector?.(`${groupedAssistantSelector}, ${groupedAssistantStartSelector}`));
+          if (hasUser && !hasAssistant) return 'user';
+          if (hasAssistant && !hasUser) return 'assistant';
+          if (hasUser && hasAssistant) return 'unknown';
+        }
+
+        if (node.matches?.('.user-turn') || node.querySelector?.('.user-turn')) return 'user';
+        if (node.matches?.('.agent-turn') || node.querySelector?.('.agent-turn')) return 'assistant';
+
+        const labelNodes = [...(node.querySelectorAll?.('h1, h2, h3, h4, h5, h6, [aria-label]') || [])].slice(0, 8);
+        const labelText = normalizeText(labelNodes.map((el) => `${el.getAttribute?.('aria-label') || ''} ${el.textContent || ''}`).join(' ')).toLowerCase();
+        if (/\b(you said|user message|your message)\b/.test(labelText)) return 'user';
+        if (/\b(chatgpt said|assistant message|assistant response)\b/.test(labelText)) return 'assistant';
+        return 'unknown';
+      }
+
+      function findGroupedAssistantBody(group) {
+        if (!group) return null;
+        const roleNode = group.querySelector?.(groupedAssistantSelector);
+        if (roleNode) return roleNode;
+
+        const startNode = group.querySelector?.(groupedAssistantStartSelector);
+        if (!startNode) return null;
+
+        // Some agent/tool turns expose only a start marker. Walk upward from that
+        // marker until we find a response-only subtree, but never cross into the
+        // group that also contains the user's bubble.
+        let current = startNode;
+        while (current?.parentElement && current.parentElement !== group) {
+          const parent = current.parentElement;
+          const containsUser = Boolean(parent.querySelector?.(groupedUserSelector));
+          const hasResponseContent = Boolean(parent.querySelector?.(
+            '.markdown, [class*="markdown"], [data-message-model-slug], [data-message-content-part], [data-conversation-role="assistant"]'
+          ));
+          if (!containsUser && hasResponseContent) return parent;
+          current = parent;
+        }
+        return startNode.parentElement && startNode.parentElement !== group ? startNode.parentElement : startNode;
+      }
+
+      function collectGroupedRendererNodes() {
+        const groups = [...document.querySelectorAll(groupedTurnSelector)]
+          .filter(outsideUiChrome)
+          .filter((node, index, all) => !all.some((other, otherIndex) => otherIndex !== index && other.contains(node)));
+        if (!groups.length) return [];
+
+        const nodes = [];
+        for (const group of groups) {
+          const user = group.querySelector?.(groupedUserSelector);
+          if (user && outsideUiChrome(user)) nodes.push(user);
+
+          const assistant = findGroupedAssistantBody(group);
+          if (assistant && outsideUiChrome(assistant)) nodes.push(assistant);
+        }
+        return sortInDocumentOrder([...new Set(nodes)]);
+      }
+
       return {
         getMessageNodes() {
-          // Live Claude conversations are virtualized. Current UIs wrap rendered
-          // turns in [data-test-render-count] containers, but the attribute value
-          // itself is a render-state counter, NOT a stable message id. Use those
-          // wrappers only to recover the visual/chronological sibling order.
+          // First support the current grouped renderer. This path is intentionally
+          // independent of the legacy role attributes because current A/B rollouts
+          // can report role=0 and turns=0 while [data-turn-key] is fully populated.
+          const grouped = collectGroupedRendererNodes();
+          if (grouped.length >= 2) return grouped;
+
+          const authored = [...document.querySelectorAll(roleSelector)]
+            .filter(outsideUiChrome)
+            .filter((node) => !node.closest?.(groupedTurnSelector))
+            .filter((node, index, all) => !all.some((other, otherIndex) => otherIndex !== index && other.contains(node) && inferRole(other) === inferRole(node)));
+          if (authored.length >= 2) return sortInDocumentOrder(authored);
+
+          const turns = [...document.querySelectorAll(legacyTurnSelector)]
+            .filter(outsideUiChrome)
+            .filter((node) => !node.closest?.(groupedTurnSelector))
+            .filter((node, index, all) => !all.some((other, otherIndex) => otherIndex !== index && other.contains(node)))
+            .filter((node) => ['user', 'assistant'].includes(inferRole(node)));
+          if (turns.length) return sortInDocumentOrder(turns);
+
+          // If only one current-renderer authored surface is mounted (for example
+          // while a reply is still streaming), return it rather than misclassifying
+          // composer/sidebar content as a turn.
+          if (grouped.length) return grouped;
+
+          const main = document.querySelector('main') || document.body;
+          return [...main.querySelectorAll('article, section')]
+            .filter(outsideUiChrome)
+            .filter((node) => ['user', 'assistant'].includes(inferRole(node)))
+            .filter((node, index, all) => !all.some((other, otherIndex) => otherIndex !== index && other.contains(node)))
+            .sort((a, b) => sortInDocumentOrder([a, b])[0] === a ? -1 : 1);
+        },
+        getRole(node) {
+          return inferRole(node);
+        },
+        findTurn(node) {
+          const role = inferRole(node);
+          if (role === 'user') {
+            const bubble = node.matches?.(groupedUserSelector) ? node : node.closest?.(groupedUserSelector);
+            if (bubble) return bubble;
+          }
+          if (role === 'assistant') {
+            const roleNode = node.matches?.(groupedAssistantSelector) ? node : node.closest?.(groupedAssistantSelector);
+            if (roleNode) return roleNode;
+            const group = node.closest?.(groupedTurnSelector);
+            const body = findGroupedAssistantBody(group);
+            if (body) return body;
+          }
+          return node.closest?.('section[data-turn], article[data-turn], [data-testid^="conversation-turn-"], [data-testid*="conversation-turn"], article, section') || node;
+        },
+        orderContainer(node) {
+          return node.closest?.(groupedTurnSelector) || this.findTurn(node);
+        },
+        identityMeta(node, turn, role) {
+          const group = node.closest?.(groupedTurnSelector) || turn?.closest?.(groupedTurnSelector);
+          const groupKey = group?.getAttribute?.('data-turn-key') || '';
+          if (groupKey) {
+            return {
+              stableId: looksUniqueDomId(groupKey) ? `${groupKey}:${role || inferRole(node)}` : '',
+              turnIndex: Number.NaN
+            };
+          }
+
+          const candidate = turn || node;
+          const testId = candidate?.getAttribute?.('data-testid') || '';
+          const match = testId.match(/conversation-turn-(\d+)/i);
+          const nestedIdNode = candidate?.querySelector?.('[data-message-id], [data-message-uuid], [data-turn-id]');
+          const explicit = node?.getAttribute?.('data-message-id')
+            || node?.getAttribute?.('data-message-uuid')
+            || node?.getAttribute?.('data-turn-id')
+            || candidate?.getAttribute?.('data-message-id')
+            || candidate?.getAttribute?.('data-message-uuid')
+            || candidate?.getAttribute?.('data-turn-id')
+            || nestedIdNode?.getAttribute?.('data-message-id')
+            || nestedIdNode?.getAttribute?.('data-message-uuid')
+            || nestedIdNode?.getAttribute?.('data-turn-id')
+            || candidate?.id
+            || '';
+          return {
+            stableId: looksUniqueDomId(explicit) ? explicit : '',
+            turnIndex: match ? Number(match[1]) : Number.NaN
+          };
+        },
+        nearbyIdentityText(node) {
+          const holder = node.closest?.(groupedTurnSelector) || this.findTurn(node);
+          const prev = holder?.previousElementSibling;
+          const next = holder?.nextElementSibling;
+          return normalizeText(`${prev?.innerText || ''}|${next?.innerText || ''}`).slice(0, 500);
+        },
+        getTitle() {
+          return cleanTitle(document.title, 'ChatGPT') || 'ChatGPT Conversation';
+        },
+        isAtConversationEnd(scrollContainer) {
+          return lastMessageNearViewportEnd(this.getMessageNodes(), scrollContainer);
+        }
+      };
+    }
+
+    if (platform.id === "claude") {
+      const userSelector = [
+        '[data-testid="user-message"]',
+        '[data-testid="human-message"]',
+        '[data-user-message-bubble="true"]',
+        '[data-message-author-role="user"]'
+      ].join(', ');
+      const assistantSelector = [
+        '.font-claude-response',
+        '.font-claude-response-body',
+        '.font-claude-message',
+        '[data-testid="ai-message"]',
+        '[data-testid="assistant-message"]',
+        '[data-testid="message-assistant"]',
+        '[data-message-author-role="assistant"]'
+      ].join(', ');
+
+      return {
+        getMessageNodes() {
           const turnContainers = [...document.querySelectorAll('[data-test-render-count]')]
             .filter((node) => !node.parentElement?.closest?.('[data-test-render-count]'))
-            .filter((node) => !node.closest('nav, aside, [role="dialog"], [role="menu"]'));
+            .filter(outsideUiChrome);
 
           const structural = [];
           for (const turn of turnContainers) {
-            const user = turn.querySelector('[data-testid="user-message"], [data-user-message-bubble="true"]');
+            const user = turn.querySelector(userSelector);
             if (user) {
               structural.push(user);
               continue;
             }
-
-            // Prefer the response wrapper so multi-block/tool-use answers remain
-            // one assistant message. Fall back to the response body/message class.
-            const assistant = turn.querySelector('.font-claude-response, .font-claude-response-body, .font-claude-message, [data-testid="ai-message"], [data-testid="message-assistant"]');
+            const assistant = turn.querySelector(assistantSelector);
             if (assistant) structural.push(assistant);
           }
-          if (structural.length >= 2) return structural;
+          if (structural.length >= 2) return sortInDocumentOrder(structural);
 
-          const users = [...document.querySelectorAll('[data-testid="user-message"], [data-user-message-bubble="true"]')];
-          let assistants = [...document.querySelectorAll('.font-claude-response')];
-          if (!assistants.length) assistants = [...document.querySelectorAll('.font-claude-response-body')];
-          if (!assistants.length) assistants = [...document.querySelectorAll('.font-claude-message, [data-testid="ai-message"], [data-testid="message-assistant"]')];
-          return sortInDocumentOrder([...users, ...assistants])
-            .filter((node) => !node.closest('nav, aside, [role="dialog"], [role="menu"]'));
+          const users = [...document.querySelectorAll(userSelector)].filter(outsideUiChrome);
+          const assistantCandidates = [...document.querySelectorAll(assistantSelector)].filter(outsideUiChrome);
+          const assistants = assistantCandidates.filter((node, index, all) => {
+            return !all.some((other, otherIndex) => otherIndex !== index && other.contains(node));
+          });
+          const combined = sortInDocumentOrder([...users, ...assistants]);
+          if (combined.length) return combined;
+
+          // Conservative fallback for a future Claude rollout: inspect rendered
+          // turn wrappers and retain only wrappers with an identifiable authored role.
+          return turnContainers.filter((turn) => turn.querySelector(userSelector) || turn.querySelector(assistantSelector));
         },
         getRole(node) {
-          return node.matches('[data-testid="user-message"], [data-user-message-bubble="true"]') || Boolean(node.closest('[data-testid="user-message"], [data-user-message-bubble="true"]')) ? "user" : "assistant";
+          if (node.matches?.(userSelector) || node.closest?.(userSelector)) return 'user';
+          if (node.matches?.(assistantSelector) || node.closest?.(assistantSelector)) return 'assistant';
+          const direct = node.getAttribute?.('data-message-author-role');
+          return direct === 'user' || direct === 'assistant' ? direct : 'unknown';
         },
         findTurn(node) {
-          // Keep serialization scoped to the authored body. The surrounding
-          // render-count wrapper contains headings/action chrome that can duplicate
-          // labels in the PDF.
+          // Keep serialization scoped to the authored body. The surrounding render
+          // wrapper contains action chrome and accessibility labels.
           return node;
         },
         orderContainer(node) {
-          return node.closest('[data-test-render-count]') || node;
+          return node.closest?.('[data-test-render-count]') || node;
         },
         identityMeta(node) {
-          const explicit = node.getAttribute('data-message-id') || node.id || "";
-          return { stableId: looksUniqueDomId(explicit) ? explicit : "", turnIndex: Number.NaN };
+          const explicit = node.getAttribute?.('data-message-id')
+            || node.getAttribute?.('data-message-uuid')
+            || node.id
+            || '';
+          return { stableId: looksUniqueDomId(explicit) ? explicit : '', turnIndex: Number.NaN };
         },
         nearbyIdentityText(node) {
-          const holder = node.closest('[data-test-render-count]') || node.parentElement;
+          const holder = node.closest?.('[data-test-render-count]') || node.parentElement;
           const prev = holder?.previousElementSibling;
           const next = holder?.nextElementSibling;
-          return normalizeText(`${prev?.innerText || ""}|${next?.innerText || ""}`).slice(0, 500);
+          return normalizeText(`${prev?.innerText || ''}|${next?.innerText || ''}`).slice(0, 500);
         },
         getTitle() {
-          // Prefer the browser title when it contains the conversation title. Claude's
-          // visible header can also contain account/share controls such as
-          // "Free plan", "Upgrade", and "Share".
-          const browserTitle = cleanTitle(document.title, "Claude");
-          if (browserTitle && browserTitle.toLowerCase() !== "claude") return browserTitle;
+          const browserTitle = cleanTitle(document.title, 'Claude');
+          if (browserTitle && browserTitle.toLowerCase() !== 'claude') return browserTitle;
 
           const header = document.querySelector('[data-testid="chat-header"], [data-testid="page-header"], [data-testid="chat-title-split"]');
           const heading = header?.querySelector('h1, h2, [data-testid*="title"], [data-test-id*="title"]');
-          const headingText = cleanTitle(normalizeText(heading?.innerText || heading?.textContent || ""), "Claude");
-          if (headingText && headingText.toLowerCase() !== "claude") return headingText;
+          const headingText = cleanTitle(normalizeText(heading?.innerText || heading?.textContent || ''), 'Claude');
+          if (headingText && headingText.toLowerCase() !== 'claude') return headingText;
 
-          const headerText = cleanTitle(normalizeText(header?.innerText || header?.textContent || ""), "Claude");
-          if (headerText && headerText.toLowerCase() !== "claude") return headerText;
-          return "Claude Conversation";
+          const headerText = cleanTitle(normalizeText(header?.innerText || header?.textContent || ''), 'Claude');
+          if (headerText && headerText.toLowerCase() !== 'claude') return headerText;
+          return 'Claude Conversation';
         },
         isAtConversationEnd(scrollContainer) {
           return lastMessageNearViewportEnd(this.getMessageNodes(), scrollContainer);
@@ -204,57 +496,60 @@
     }
 
     if (platform.id === "gemini") {
+      const userSelector = 'user-query, .user-query, .user-query-container, [data-message-author="user"], [data-message-author-role="user"]';
+      const assistantSelector = 'model-response, .model-response, .model-response-container, response-container, [data-message-author="assistant"], [data-message-author-role="assistant"]';
+
       return {
         getMessageNodes() {
-          // Gemini's reliable structure is one conversation container containing
-          // a <user-query> and a <model-response>. Restrict extraction to those
-          // authored components so source panes, nested markdown, and composer UI
-          // are never counted as extra messages.
           const containers = [...document.querySelectorAll('.conversation-container')]
-            .filter((node) => !node.parentElement?.closest?.('.conversation-container'));
+            .filter((node) => !node.parentElement?.closest?.('.conversation-container'))
+            .filter(outsideUiChrome);
           const structural = [];
           for (const container of containers) {
-            const user = container.querySelector('user-query');
-            const model = container.querySelector('model-response');
+            const user = container.querySelector('user-query') || container.querySelector(userSelector);
+            const model = container.querySelector('model-response') || container.querySelector(assistantSelector);
             if (user) structural.push(user);
             if (model) structural.push(model);
           }
           if (structural.length) return sortInDocumentOrder(structural);
 
-          let primary = [...document.querySelectorAll('user-query, model-response')]
-            .filter((node) => !node.closest('nav, aside, [role="dialog"], [role="menu"]'));
-          primary = primary.filter((node, index) => !primary.some((other, otherIndex) => otherIndex !== index && other.contains(node)));
-          if (primary.length) return sortInDocumentOrder(primary);
-
-          const users = [...document.querySelectorAll('.user-query, [data-message-author="user"]')];
-          const assistants = [...document.querySelectorAll('.model-response, [data-message-author="assistant"]')];
-          return sortInDocumentOrder([...users, ...assistants])
-            .filter((node) => !node.closest('nav, aside, [role="dialog"], [role="menu"]'));
+          const primary = sortInDocumentOrder([
+            ...document.querySelectorAll(userSelector),
+            ...document.querySelectorAll(assistantSelector)
+          ])
+            .filter(outsideUiChrome)
+            .filter((node, index, all) => !all.some((other, otherIndex) => otherIndex !== index && other.contains(node) && this.getRole(other) === this.getRole(node)));
+          return primary;
         },
         getRole(node) {
-          const tag = node.tagName?.toLowerCase?.() || "";
-          if (tag === 'user-query' || node.matches('.user-query, [data-message-author="user"]') || node.closest('user-query')) return "user";
-          return "assistant";
+          const tag = node.tagName?.toLowerCase?.() || '';
+          if (tag === 'user-query' || node.matches?.(userSelector) || node.closest?.('user-query')) return 'user';
+          if (tag === 'model-response' || node.matches?.(assistantSelector) || node.closest?.('model-response')) return 'assistant';
+          return 'unknown';
         },
         findTurn(node) {
-          return node.closest('user-query, model-response') || node;
+          return node.closest?.('user-query, model-response, .user-query, .model-response, .user-query-container, .model-response-container, response-container') || node;
         },
         identityMeta(node, turn) {
           const candidate = turn || node;
-          const explicit = candidate.getAttribute?.('data-message-id') || candidate.getAttribute?.('data-response-id') || candidate.getAttribute?.('data-id') || candidate.id || "";
-          return { stableId: looksUniqueDomId(explicit) ? explicit : "", turnIndex: Number.NaN };
+          const explicit = candidate.getAttribute?.('data-message-id')
+            || candidate.getAttribute?.('data-response-id')
+            || candidate.getAttribute?.('data-id')
+            || candidate.id
+            || '';
+          return { stableId: looksUniqueDomId(explicit) ? explicit : '', turnIndex: Number.NaN };
         },
         nearbyIdentityText(node) {
-          const container = node.closest('.conversation-container');
+          const container = node.closest?.('.conversation-container');
           const prev = container?.previousElementSibling;
           const next = container?.nextElementSibling;
-          return normalizeText(`${prev?.innerText || ""}|${next?.innerText || ""}`).slice(0, 500);
+          return normalizeText(`${prev?.innerText || ''}|${next?.innerText || ''}`).slice(0, 500);
         },
         getTitle() {
-          const title = cleanTitle(document.title, "Gemini");
-          if (title && title.toLowerCase() !== "gemini") return title;
+          const title = cleanTitle(document.title, 'Gemini');
+          if (title && title.toLowerCase() !== 'gemini') return title;
           const candidate = document.querySelector('[data-test-id="conversation-title"], [data-testid="conversation-title"], main h1');
-          return normalizeText(candidate?.innerText || candidate?.textContent || "") || "Gemini Conversation";
+          return normalizeText(candidate?.innerText || candidate?.textContent || '') || 'Gemini Conversation';
         },
         isAtConversationEnd(scrollContainer) {
           return lastMessageNearViewportEnd(this.getMessageNodes(), scrollContainer);
@@ -263,70 +558,1045 @@
     }
 
     return {
-      getMessageNodes() {
-        return [...document.querySelectorAll('[data-message-author-role], [data-role="user"], [data-role="assistant"]')];
-      },
-      getRole(node) {
-        return node.getAttribute('data-message-author-role') || node.getAttribute('data-role') || "unknown";
-      },
-      findTurn(node) {
-        return node.closest('[data-testid^="conversation-turn-"]') || node.closest('article') || node;
-      },
-      identityMeta(node, turn) {
-        const testId = turn?.getAttribute?.('data-testid') || "";
-        const match = testId.match(/conversation-turn-(\\d+)/i);
-        return { stableId: "", turnIndex: match ? Number(match[1]) : Number.NaN };
-      },
-      nearbyIdentityText() { return ""; },
-      getTitle() { return document.title; }
+      getMessageNodes() { return []; },
+      getRole() { return 'unknown'; },
+      findTurn(node) { return node; },
+      identityMeta() { return { stableId: '', turnIndex: Number.NaN }; },
+      nearbyIdentityText() { return ''; },
+      getTitle() { return 'Conversation'; }
     };
+  }
+
+
+  function getChatGPTConversationContext() {
+    try {
+      const url = new URL(location.href);
+      const parts = url.pathname.split("/").filter(Boolean);
+
+      const shareMarker = parts.lastIndexOf("share");
+      if (shareMarker >= 0 && parts[shareMarker + 1]) {
+        let shareId = parts[shareMarker + 1];
+        // Some ChatGPT routes insert a short locale/channel segment before the id.
+        if (/^[a-z]{1,4}$/i.test(shareId) && parts[shareMarker + 2]) shareId = parts[shareMarker + 2];
+        return { conversationId: "", projectId: "", shareId, isShare: true };
+      }
+
+      const marker = parts.lastIndexOf("c");
+      if (marker < 0 || !parts[marker + 1]) return null;
+      const conversationId = parts[marker + 1];
+      const projectId = parts.slice(0, marker).find((part) => part.startsWith("g-p-")) || "";
+      return { conversationId, projectId, shareId: "", isShare: false };
+    } catch {
+      return null;
+    }
+  }
+
+  function decodeJwtPayload(token) {
+    try {
+      const parts = String(token || "").split(".");
+      if (parts.length !== 3) return null;
+      const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/")
+        .padEnd(Math.ceil(parts[1].length / 4) * 4, "=");
+      const bytes = Uint8Array.from(atob(base64), (ch) => ch.charCodeAt(0));
+      return JSON.parse(new TextDecoder().decode(bytes));
+    } catch {
+      return null;
+    }
+  }
+
+  function getChatGPTAccountId(session, accessToken) {
+    const explicit = session?.account?.id
+      || session?.accountId
+      || session?.user?.account_id
+      || session?.user?.accountId
+      || "";
+    if (explicit) return explicit;
+    const claims = decodeJwtPayload(accessToken) || {};
+    return claims?.["https://api.openai.com/auth"]?.chatgpt_account_id
+      || claims?.chatgpt_account_id
+      || "";
+  }
+
+  function htmlFromPlainText(value) {
+    const text = String(value || "").replace(/\r\n?/g, "\n");
+    if (!text.trim()) return "";
+
+    const chunks = [];
+    let cursor = 0;
+    const fence = /```([^\n`]*)\n?([\s\S]*?)```/g;
+    let match;
+    while ((match = fence.exec(text))) {
+      if (match.index > cursor) chunks.push({ type: "text", value: text.slice(cursor, match.index) });
+      chunks.push({ type: "code", lang: (match[1] || "").trim(), value: match[2] || "" });
+      cursor = fence.lastIndex;
+    }
+    if (cursor < text.length) chunks.push({ type: "text", value: text.slice(cursor) });
+
+    return chunks.map((chunk) => {
+      if (chunk.type === "code") {
+        const language = chunk.lang ? ` data-language="${escapeHtml(chunk.lang)}"` : "";
+        return `<pre><code${language}>${escapeHtml(chunk.value.replace(/\n$/, ""))}</code></pre>`;
+      }
+      return chunk.value
+        .split(/\n{2,}/)
+        .map((block) => block.trim())
+        .filter(Boolean)
+        .map((block) => {
+          const heading = block.match(/^(#{1,6})\s+(.+)$/s);
+          if (heading && !heading[2].includes("\n")) {
+            const level = Math.min(6, heading[1].length);
+            return `<h${level}>${escapeHtml(heading[2])}</h${level}>`;
+          }
+          const lines = block.split("\n");
+          if (lines.length > 1 && lines.every((line) => /^\s*[-*+]\s+/.test(line))) {
+            return `<ul>${lines.map((line) => `<li>${escapeHtml(line.replace(/^\s*[-*+]\s+/, ""))}</li>`).join("")}</ul>`;
+          }
+          if (lines.length > 1 && lines.every((line) => /^\s*\d+[.)]\s+/.test(line))) {
+            return `<ol>${lines.map((line) => `<li>${escapeHtml(line.replace(/^\s*\d+[.)]\s+/, ""))}</li>`).join("")}</ol>`;
+          }
+          return `<p>${lines.map((line) => escapeHtml(line)).join("<br>")}</p>`;
+        }).join("");
+    }).join("");
+  }
+
+  function chatGPTAssetPointerInfo(part) {
+    const directUrl = String(part?.image_url || part?.url || "").trim();
+    const pointer = String(part?.asset_pointer || part?.assetPointer || "").trim();
+    if (/^https:\/\//i.test(directUrl)) return { kind: "url", value: directUrl, fileId: "" };
+    if (/^https:\/\//i.test(pointer)) return { kind: "url", value: pointer, fileId: "" };
+    if (pointer.startsWith("file-service://")) {
+      return { kind: "file-service", value: pointer, fileId: pointer.slice("file-service://".length) };
+    }
+    if (pointer.startsWith("sediment://")) {
+      return { kind: "sediment", value: pointer, fileId: pointer.slice("sediment://".length) };
+    }
+    const fallbackId = String(part?.file_id || part?.fileId || part?.id || "").trim();
+    if (fallbackId) return { kind: "file-service", value: `file-service://${fallbackId}`, fileId: fallbackId };
+    return { kind: "", value: pointer || directUrl, fileId: "" };
+  }
+
+  function downloadUrlFromPayload(payload) {
+    if (!payload || typeof payload !== "object") return "";
+    return String(
+      payload.download_url
+      || payload.downloadUrl
+      || payload.signed_url
+      || payload.signedUrl
+      || payload.url
+      || payload.file_url
+      || payload.fileUrl
+      || ""
+    ).trim();
+  }
+
+  async function requestChatGPTAssetDownloadUrl(part, context, headers, signal) {
+    const info = chatGPTAssetPointerInfo(part);
+    if (info.kind === "url" && info.value) return info.value;
+    if (!info.fileId) return "";
+
+    const cacheKey = `${context?.conversationId || ""}|${context?.shareId || ""}|${info.kind}|${info.fileId}`;
+    if (chatGPTAssetUrlCache.has(cacheKey)) return chatGPTAssetUrlCache.get(cacheKey);
+
+    const promise = (async () => {
+      const encodedFileId = encodeURIComponent(info.fileId);
+      const encodedConversationId = encodeURIComponent(context?.conversationId || "");
+      const encodedShareId = encodeURIComponent(context?.shareId || "");
+      const endpoints = [];
+
+      // Shared conversations expose attachment references through the share id, not
+      // the /c/<conversation-id> route. Prefer that resolver when available.
+      if (context?.shareId) {
+        endpoints.push(`/backend-api/files/${encodedFileId}/download?shared_conversation_id=${encodedShareId}`);
+      }
+
+      if (info.kind === "sediment") {
+        if (context?.conversationId) {
+          endpoints.push(`/backend-api/conversation/${encodedConversationId}/attachment/${encodedFileId}/download`);
+        }
+      } else {
+        if (context?.conversationId) {
+          endpoints.push(`/backend-api/files/download/${encodedFileId}?conversation_id=${encodedConversationId}&inline=true`);
+        }
+        endpoints.push(`/backend-api/files/${encodedFileId}/download`);
+      }
+
+      for (const endpoint of endpoints) {
+        if (signal?.aborted) throw makeCancelledError();
+        try {
+          const response = await fetch(endpoint, {
+            method: "GET",
+            credentials: "include",
+            cache: "no-store",
+            redirect: "follow",
+            headers: {
+              ...headers,
+              Accept: "application/json, image/*, */*"
+            },
+            signal
+          });
+          if (!response.ok) continue;
+
+          const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+          if (contentType.includes("application/json") || contentType.includes("text/json")) {
+            const payload = await response.json().catch(() => null);
+            const url = downloadUrlFromPayload(payload);
+            if (url) return url;
+            continue;
+          }
+
+          if (response.url && /^https:\/\//i.test(response.url) && response.url !== new URL(endpoint, location.origin).href) {
+            return response.url;
+          }
+        } catch (error) {
+          if (signal?.aborted) throw makeCancelledError();
+        }
+      }
+      return "";
+    })();
+
+    chatGPTAssetUrlCache.set(cacheKey, promise);
+    try {
+      const url = await promise;
+      chatGPTAssetUrlCache.set(cacheKey, Promise.resolve(url));
+      return url;
+    } catch (error) {
+      chatGPTAssetUrlCache.delete(cacheKey);
+      throw error;
+    }
+  }
+
+  function chatGPTMediaLabel(part, fallback = "Image attachment") {
+    return String(
+      part?.metadata?.name
+      || part?.metadata?.filename
+      || part?.name
+      || part?.filename
+      || fallback
+    ).trim() || fallback;
+  }
+
+  async function renderChatGPTImagePart(part, context, headers, signal, embedImages, role) {
+    const label = chatGPTMediaLabel(part);
+    const remoteUrl = await requestChatGPTAssetDownloadUrl(part, context, headers, signal);
+    if (!remoteUrl) return { html: `<div class="attachment-card">${escapeHtml(label)}</div>`, mediaCount: 1 };
+
+    let src = remoteUrl;
+    if (embedImages) {
+      const dataUrl = await fetchDataUrlResource(remoteUrl);
+      if (dataUrl) src = dataUrl;
+    }
+
+    const cls = role === "user" ? "export-user-media" : "export-content-image";
+    return {
+      html: `<figure class="export-api-image"><img class="${cls}" data-export-image-kind="${cls}" src="${escapeHtml(src)}" alt="${escapeHtml(label)}" loading="eager" decoding="sync"></figure>`,
+      mediaCount: 1
+    };
+  }
+
+  async function chatGPTContentToHtml(content, { context, headers, signal, embedImages = true, role = "assistant", metadata = null } = {}) {
+    if (!content || typeof content !== "object") return { html: "", text: "", mediaCount: 0 };
+    const contentType = String(content.content_type || "");
+    const parts = Array.isArray(content.parts) ? content.parts : [];
+    const textParts = [];
+    const htmlParts = [];
+    const seenAssets = new Set();
+    let mediaCount = 0;
+
+    for (const part of parts) {
+      if (signal?.aborted) throw makeCancelledError();
+      if (typeof part === "string") {
+        if (part.trim()) {
+          textParts.push(part);
+          htmlParts.push(htmlFromPlainText(part));
+        }
+        continue;
+      }
+      if (!part || typeof part !== "object") continue;
+
+      const kind = String(part.content_type || part.type || "").toLowerCase();
+      const partText = typeof part.text === "string" && part.text.trim()
+        ? part.text
+        : (typeof part.caption === "string" && part.caption.trim() ? part.caption : "");
+      if (partText) {
+        textParts.push(partText);
+        htmlParts.push(htmlFromPlainText(partText));
+      }
+
+      const assetInfo = chatGPTAssetPointerInfo(part);
+      const assetKey = assetInfo.value || assetInfo.fileId || String(part.image_url || "");
+      const isImage = kind.includes("image") || Boolean(part.image_url) || kind === "image_asset_pointer";
+
+      if (isImage) {
+        if (assetKey && seenAssets.has(assetKey)) continue;
+        if (assetKey) seenAssets.add(assetKey);
+        const rendered = await renderChatGPTImagePart(part, context, headers, signal, embedImages, role);
+        htmlParts.push(rendered.html);
+        mediaCount += rendered.mediaCount;
+      } else if (kind.includes("file") || kind.includes("audio") || kind.includes("video") || part.asset_pointer || part.file_id || part.filename) {
+        if (assetKey && seenAssets.has(assetKey)) continue;
+        if (assetKey) seenAssets.add(assetKey);
+        mediaCount += 1;
+        const label = chatGPTMediaLabel(part, "Attachment");
+        htmlParts.push(`<div class="attachment-card">${escapeHtml(label)}</div>`);
+      }
+    }
+
+    // Some uploads are represented only in message.metadata.attachments rather than
+    // content.parts. Preserve them too, but deduplicate against image_asset_pointer parts.
+    const attachments = Array.isArray(metadata?.attachments) ? metadata.attachments : [];
+    for (const attachment of attachments) {
+      if (signal?.aborted) throw makeCancelledError();
+      if (!attachment || typeof attachment !== "object") continue;
+      const fileId = String(attachment.id || attachment.file_id || attachment.fileId || "").trim();
+      const assetKey = fileId ? `file-service://${fileId}` : String(attachment.url || "");
+      if (assetKey && seenAssets.has(assetKey)) continue;
+      if (assetKey) seenAssets.add(assetKey);
+
+      const mime = String(attachment.mime_type || attachment.mimeType || attachment.type || "").toLowerCase();
+      const name = String(attachment.name || attachment.filename || "Attachment");
+      const looksImage = mime.startsWith("image/") || /\.(png|jpe?g|webp|gif|bmp|svg)$/i.test(name);
+      if (looksImage && (fileId || attachment.url)) {
+        const rendered = await renderChatGPTImagePart({
+          ...attachment,
+          asset_pointer: fileId ? `file-service://${fileId}` : "",
+          image_url: attachment.url || "",
+          filename: name
+        }, context, headers, signal, embedImages, role);
+        htmlParts.push(rendered.html);
+        mediaCount += rendered.mediaCount;
+      } else {
+        mediaCount += 1;
+        htmlParts.push(`<div class="attachment-card">${escapeHtml(name)}</div>`);
+      }
+    }
+
+    if (!textParts.length) {
+      if (typeof content.text === "string" && content.text.trim()) {
+        textParts.push(content.text);
+        htmlParts.unshift(htmlFromPlainText(content.text));
+      }
+      if (typeof content.result === "string" && content.result.trim()) {
+        textParts.push(content.result);
+        htmlParts.unshift(htmlFromPlainText(content.result));
+      }
+    }
+
+    const text = textParts.join("\n\n").trim();
+    let html = htmlParts.join("");
+    if (contentType === "code" && text) html = `<pre><code>${escapeHtml(text)}</code></pre>` + htmlParts.filter((item) => item.includes("<img") || item.includes("attachment-card")).join("");
+    if (!html && text) html = htmlFromPlainText(text);
+    return { html, text, mediaCount };
+  }
+
+
+  function isExportableChatGPTMessage(message, { skipEditableContext = false } = {}) {
+    if (!message || typeof message !== "object") return false;
+    const role = message.author?.role;
+    if (role !== "user" && role !== "assistant") return false;
+    if (role === "assistant" && message.recipient && message.recipient !== "all") return false;
+    if (message.metadata?.is_visually_hidden_from_conversation === true) return false;
+    if (message.metadata?.is_user_system_message === true) return false;
+    if (skipEditableContext && message.content?.content_type === "model_editable_context") return false;
+    return true;
+  }
+
+  async function renderChatGPTMessageBatch(nodes, {
+    context,
+    headers,
+    signal,
+    embedImages,
+    keyPrefix,
+    progressStart,
+    progressSpan,
+    progressStatus,
+    skipEditableContext = false
+  }) {
+    const entries = [];
+    for (let index = 0; index < nodes.length; index += 1) {
+      const message = nodes[index]?.message;
+      if (!isExportableChatGPTMessage(message, { skipEditableContext })) continue;
+      entries.push({ nodeIndex: index, message });
+    }
+
+    let completedRenderable = 0;
+    let completedMedia = 0;
+    const workers = adaptiveIoConcurrency();
+    const renderedEntries = await mapWithConcurrency(entries, async (entry) => {
+      if (signal?.aborted) throw makeCancelledError();
+      const message = entry.message;
+      const role = message.author?.role;
+      const rendered = await chatGPTContentToHtml(message.content, {
+        context,
+        headers,
+        signal,
+        embedImages,
+        role,
+        metadata: message.metadata || null
+      });
+      if (!rendered.text && !rendered.html) return null;
+      return {
+        key: `${keyPrefix}:${message.id || entry.nodeIndex}`,
+        role,
+        turnIndex: entry.nodeIndex,
+        positionHint: entry.nodeIndex,
+        html: rendered.html || `<p>${escapeHtml(rendered.text)}</p>`,
+        text: rendered.text,
+        imageCount: rendered.mediaCount,
+        identitySignature: String(message.id || entry.nodeIndex)
+      };
+    }, {
+      concurrency: workers,
+      signal,
+      onSettled: (result, _index, settled, total) => {
+        if (result) {
+          completedRenderable += 1;
+          completedMedia += Number(result.imageCount || 0);
+        }
+        const fraction = total ? settled / total : 1;
+        notifyProgress({
+          percent: progressStart + Math.round(fraction * progressSpan),
+          messageCount: completedRenderable,
+          imageCount: completedMedia,
+          status: progressStatus,
+          running: true
+        });
+      }
+    });
+
+    const messages = renderedEntries.filter(Boolean).map((item, discoveryOrder) => ({ ...item, discoveryOrder }));
+    const imageCount = messages.reduce((sum, item) => sum + Number(item.imageCount || 0), 0);
+    return { messages, imageCount, workers };
+  }
+
+  function collectChatGPTBranch(conversation) {
+    const mapping = conversation?.mapping;
+    if (!mapping || typeof mapping !== "object") return [];
+    let currentId = conversation.current_node || conversation.currentNode || "";
+    if (!currentId || !mapping[currentId]) {
+      const nodes = Object.values(mapping);
+      const leaf = nodes.find((node) => node && Array.isArray(node.children) && node.children.length === 0);
+      currentId = leaf?.id || leaf?.message?.id || "";
+    }
+
+    const branch = [];
+    const seen = new Set();
+    while (currentId && mapping[currentId] && !seen.has(currentId)) {
+      seen.add(currentId);
+      const node = mapping[currentId];
+      branch.push(node);
+      currentId = node.parent || "";
+    }
+    branch.reverse();
+    return branch;
+  }
+
+  function orderChatGPTShareNodes(share) {
+    if (Array.isArray(share?.linear_conversation) && share.linear_conversation.length) {
+      return share.linear_conversation;
+    }
+    const mapping = share?.mapping;
+    if (!mapping || typeof mapping !== "object") return [];
+    const nodes = Object.values(mapping).filter(Boolean);
+    if (!nodes.length) return [];
+
+    const root = nodes.find((node) => !node?.parent) || nodes[0];
+    const ordered = [];
+    const seen = new Set();
+    let cursor = root;
+    while (cursor) {
+      const id = cursor.id || cursor.message?.id || `share-node-${ordered.length}`;
+      if (seen.has(id)) break;
+      seen.add(id);
+      ordered.push(cursor);
+      const childId = Array.isArray(cursor.children) ? cursor.children[0] : "";
+      cursor = childId ? mapping[childId] : null;
+    }
+    return ordered;
+  }
+
+  function extractChatGPTTurboChunks(source) {
+    const text = String(source || "");
+    const chunks = [];
+
+    // React Router emits one or more JavaScript calls such as:
+    //   window.__reactRouterContext.streamController.enqueue("...")
+    // Use a deliberately tolerant matcher because whitespace and a trailing
+    // semicolon have changed between releases.
+    const pattern = /streamController\.enqueue\s*\(\s*("(?:\\.|[^"\\])*")\s*\)\s*;?/gs;
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      try {
+        const decoded = JSON.parse(match[1]);
+        if (typeof decoded === "string" && decoded) chunks.push(decoded);
+      } catch {
+        // Ignore malformed/non-payload calls and continue looking for usable chunks.
+      }
+    }
+    return chunks;
+  }
+
+  function decodeChatGPTTurboStreamFromSource(source) {
+    const chunks = extractChatGPTTurboChunks(source);
+    if (!chunks.length) throw new Error("No ChatGPT public-share turbo-stream payload was found.");
+
+    // React Router's current single-fetch format can defer parts of the root table.
+    // The first payload is the positional table; later payloads can be promise
+    // patches such as `P123:<json>`. Ignoring those patches can leave the
+    // conversation behind an unresolved ["P", ...] placeholder, which is exactly
+    // what happened on some large shared conversations.
+    const raw = [];
+    let foundInitial = false;
+    for (const chunk of chunks) {
+      const payload = String(chunk || "");
+      if (!payload) continue;
+      const normalizedPayload = payload.trimStart();
+
+      if (normalizedPayload.startsWith("[")) {
+        try {
+          const parsed = JSON.parse(normalizedPayload);
+          if (Array.isArray(parsed)) {
+            raw.length = 0;
+            raw.push(...parsed);
+            foundInitial = true;
+          }
+        } catch {
+          // Keep scanning; another enqueue may contain the initial table.
+        }
+        continue;
+      }
+
+      const promiseMatch = normalizedPayload.match(/^P(\d+):([\s\S]*)$/);
+      if (promiseMatch) {
+        const index = Number(promiseMatch[1]);
+        let promisePayload = promiseMatch[2];
+        if (promisePayload.endsWith("\n")) promisePayload = promisePayload.slice(0, -1);
+        try {
+          raw[index] = JSON.parse(promisePayload);
+        } catch {
+          // A malformed deferred patch should not destroy an otherwise usable root.
+        }
+      }
+    }
+
+    if (!foundInitial || !raw.length) {
+      throw new Error("ChatGPT public-share turbo-stream did not contain an initial reference table.");
+    }
+
+    const undefinedSentinel = Symbol("chatfolio-undefined");
+    const memo = new Map();
+
+    const resolve = (reference) => {
+      if (!Number.isInteger(reference)) return reference;
+      if (reference === -1) return null;
+      if (reference === -5) return undefinedSentinel;
+      if (reference === -6) return false;
+      if (reference === -7) return true;
+      if (reference < 0) return `C${reference}`;
+      if (memo.has(reference)) return memo.get(reference);
+      if (reference >= raw.length) return null;
+
+      const value = raw[reference];
+      if (Array.isArray(value)) {
+        // A promise placeholder may survive if a response truly omitted its patch.
+        // Do not turn it into fake conversation data.
+        if (value.length && value[0] === "P") {
+          memo.set(reference, null);
+          return null;
+        }
+        const items = [];
+        memo.set(reference, items);
+        for (const item of value) {
+          const decoded = resolve(item);
+          if (decoded !== undefinedSentinel) items.push(decoded);
+        }
+        return items;
+      }
+
+      if (value && typeof value === "object") {
+        const object = {};
+        memo.set(reference, object);
+        for (const [rawKey, rawValue] of Object.entries(value)) {
+          let key = rawKey;
+          if (/^_\d+$/.test(rawKey)) {
+            const decodedKey = resolve(Number(rawKey.slice(1)));
+            if (decodedKey !== null && decodedKey !== undefined && decodedKey !== undefinedSentinel) key = String(decodedKey);
+          }
+          const decodedValue = resolve(rawValue);
+          if (decodedValue !== undefinedSentinel) object[key] = decodedValue;
+        }
+        return object;
+      }
+
+      memo.set(reference, value);
+      return value;
+    };
+
+    const root = resolve(0);
+    return root === undefinedSentinel ? null : root;
+  }
+
+  function findChatGPTShareContainer(root) {
+    const stack = [root];
+    const seen = new Set();
+    while (stack.length) {
+      const value = stack.pop();
+      if (!value || typeof value !== "object" || seen.has(value)) continue;
+      seen.add(value);
+
+      // Shared-page payloads are not uniform across ChatGPT rollouts. Some expose
+      // linear_conversation directly, while others expose only mapping/current_node.
+      // Both are complete conversation representations and orderChatGPTShareNodes()
+      // already knows how to consume either form.
+      if (Array.isArray(value.linear_conversation) && value.linear_conversation.length) return value;
+      if (value.mapping && typeof value.mapping === "object" && (value.current_node || value.currentNode)) return value;
+
+      // Current React Router share pages often nest the actual model under
+      // loaderData -> route -> serverResponse -> data. Check that shape eagerly so
+      // a route wrapper is not mistaken for the conversation itself.
+      if (value.loaderData && typeof value.loaderData === "object") {
+        for (const routeData of Object.values(value.loaderData)) {
+          const direct = routeData?.serverResponse?.data;
+          if (!direct || typeof direct !== "object") continue;
+          if (Array.isArray(direct.linear_conversation) && direct.linear_conversation.length) return direct;
+          if (direct.mapping && typeof direct.mapping === "object" && (direct.current_node || direct.currentNode)) return direct;
+        }
+      }
+
+      if (Array.isArray(value)) {
+        for (let index = value.length - 1; index >= 0; index -= 1) stack.push(value[index]);
+      } else {
+        const values = Object.values(value);
+        for (let index = values.length - 1; index >= 0; index -= 1) stack.push(values[index]);
+      }
+    }
+    return null;
+  }
+
+  function decodeChatGPTShareFromLoadedDocument() {
+    const scripts = Array.from(document.scripts || []);
+    if (!scripts.length) return null;
+    const source = scripts.map((script) => script.textContent || "").join("\n");
+    if (!source.includes("streamController.enqueue")) return null;
+    const root = decodeChatGPTTurboStreamFromSource(source);
+    return findChatGPTShareContainer(root);
+  }
+
+  async function fetchChatGPTShareFromPublicPage(signal) {
+    // Public share pages serialize the conversation into React Router hydration
+    // data. First inspect the already-loaded document, then refetch the PUBLIC page
+    // without account cookies. The anonymous response is often more fully SSR'd
+    // than the signed-in SPA shell and avoids workspace/account-specific routing.
+    let share = null;
+    try {
+      share = decodeChatGPTShareFromLoadedDocument();
+    } catch {
+      share = null;
+    }
+    if (share) return share;
+
+    const attempts = [
+      { credentials: "omit", label: "anonymous public page" },
+      { credentials: "include", label: "signed-in public page" }
+    ];
+    const errors = [];
+
+    for (const attempt of attempts) {
+      try {
+        const response = await fetch(location.href, {
+          method: "GET",
+          credentials: attempt.credentials,
+          cache: "no-store",
+          headers: {
+            Accept: "text/html,application/xhtml+xml",
+            "Cache-Control": "no-cache"
+          },
+          signal
+        });
+        if (!response.ok) {
+          errors.push(`${attempt.label} HTTP ${response.status}`);
+          continue;
+        }
+        const html = await response.text();
+        const root = decodeChatGPTTurboStreamFromSource(html);
+        share = findChatGPTShareContainer(root);
+        if (share) return share;
+        errors.push(`${attempt.label} had hydration data but no complete conversation object`);
+      } catch (error) {
+        if (signal?.aborted) throw makeCancelledError();
+        errors.push(`${attempt.label}: ${error?.message || error}`);
+      }
+    }
+
+    throw new Error(`ChatGPT public share page did not expose a complete conversation (${errors.join("; ")}).`);
+  }
+
+  async function getOptionalChatGPTAuthHeaders(signal) {
+    try {
+      const sessionResponse = await fetch("/api/auth/session", {
+        credentials: "include",
+        cache: "no-store",
+        signal
+      });
+      if (!sessionResponse.ok) return {};
+      const authSession = await sessionResponse.json();
+      const accessToken = authSession?.accessToken || "";
+      if (!accessToken) return {};
+      const headers = { Authorization: `Bearer ${accessToken}` };
+      const accountId = getChatGPTAccountId(authSession, accessToken);
+      if (accountId) headers["ChatGPT-Account-ID"] = accountId;
+      return headers;
+    } catch (error) {
+      if (signal?.aborted) throw makeCancelledError();
+      return {};
+    }
+  }
+
+  async function collectChatGPTShareViaMetadata(options, session, context) {
+    const signal = session.controller.signal;
+    throwIfCancelled(session);
+
+    notifyProgress({
+      percent: 8,
+      messageCount: 0,
+      imageCount: 0,
+      status: "Reading the complete shared ChatGPT conversation...",
+      running: true
+    });
+
+    let share;
+    let publicPageError = null;
+    try {
+      share = await fetchChatGPTShareFromPublicPage(signal);
+    } catch (error) {
+      if (signal?.aborted) throw makeCancelledError();
+      publicPageError = error;
+    }
+
+    // Compatibility fallback for older/current deployments where the legacy JSON
+    // endpoint is still readable. Do not make it the primary path: public share
+    // links can legitimately return 401/403 here while the share page itself
+    // contains the complete first-party hydration payload.
+    if (!share) {
+      const endpoint = `/backend-api/share/${encodeURIComponent(context.shareId)}`;
+      const authHeaders = await getOptionalChatGPTAuthHeaders(signal);
+      const response = await fetch(endpoint, {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: { Accept: "application/json", ...authHeaders },
+        signal
+      });
+      if (!response.ok) {
+        const prefix = publicPageError?.message ? `${publicPageError.message} ` : "";
+        throw new Error(`${prefix}Legacy shared-conversation endpoint returned HTTP ${response.status}.`);
+      }
+      share = await response.json();
+    }
+    throwIfCancelled(session);
+    const nodes = orderChatGPTShareNodes(share);
+    if (!nodes.length) throw new Error("ChatGPT shared-conversation data contained no readable message tree.");
+
+    notifyProgress({
+      percent: 24,
+      messageCount: 0,
+      imageCount: 0,
+      status: `Shared conversation received. Reading ${nodes.length} stored turns...`,
+      running: true
+    });
+
+    const headers = await getOptionalChatGPTAuthHeaders(signal);
+    const mediaContext = {
+      ...context,
+      conversationId: String(share?.conversation_id || ""),
+      shareId: context.shareId,
+      isShare: true
+    };
+
+    const renderedBatch = await renderChatGPTMessageBatch(nodes, {
+      context: mediaContext,
+      headers,
+      signal,
+      embedImages: options.embedImages !== false,
+      keyPrefix: "chatgpt:share",
+      progressStart: 24,
+      progressSpan: 58,
+      progressStatus: "Exporting conversation...",
+      skipEditableContext: true
+    });
+    const { messages, imageCount } = renderedBatch;
+
+    if (!messages.length) throw new Error("ChatGPT shared-conversation data was available, but no visible user/assistant messages were found.");
+    notifyProgress({
+      percent: 84,
+      messageCount: messages.length,
+      imageCount,
+      status: "Exporting conversation...",
+      running: true
+    });
+
+    return {
+      messages,
+      imageCount,
+      processedMediaKeys: new Set(),
+      identityCollisions: 0,
+      title: cleanTitle(share?.title || document.title, "ChatGPT") || "ChatGPT Conversation",
+      extractionSource: "share-metadata"
+    };
+  }
+
+  async function collectChatGPTViaMetadata(options, session) {
+    const context = getChatGPTConversationContext();
+    if (!context) return null;
+    if (context.isShare && context.shareId) {
+      return collectChatGPTShareViaMetadata(options, session, context);
+    }
+    const signal = session.controller.signal;
+    throwIfCancelled(session);
+
+    notifyProgress({
+      percent: 5,
+      messageCount: 0,
+      imageCount: 0,
+      status: "Connecting to the current ChatGPT conversation...",
+      running: true
+    });
+
+    const sessionResponse = await fetch("/api/auth/session", {
+      credentials: "include",
+      cache: "no-store",
+      signal
+    });
+    if (!sessionResponse.ok) throw new Error(`ChatGPT session metadata returned HTTP ${sessionResponse.status}.`);
+    notifyProgress({
+      percent: 12,
+      messageCount: 0,
+      imageCount: 0,
+      status: "Authenticated. Requesting the complete ChatGPT conversation...",
+      running: true
+    });
+    const authSession = await sessionResponse.json();
+    const accessToken = authSession?.accessToken || "";
+    if (!accessToken) throw new Error("ChatGPT session metadata did not provide a temporary access token.");
+    const accountId = getChatGPTAccountId(authSession, accessToken);
+    if (!accountId) throw new Error("ChatGPT account metadata could not be resolved for this conversation.");
+
+    const endpoint = `/backend-api/conversation/${encodeURIComponent(context.conversationId)}`;
+    const headers = {
+      Accept: "application/json",
+      Authorization: `Bearer ${accessToken}`,
+      "ChatGPT-Account-ID": accountId,
+      "X-OpenAI-Target-Path": endpoint,
+      "X-OpenAI-Target-Route": "/backend-api/conversation/{conversation_id}"
+    };
+    if (context.projectId) headers["chatgpt-project-id"] = context.projectId;
+
+    notifyProgress({
+      percent: 20,
+      messageCount: 0,
+      imageCount: 0,
+      status: "Downloading the active ChatGPT conversation branch...",
+      running: true
+    });
+
+    const response = await fetch(endpoint, {
+      method: "GET",
+      credentials: "include",
+      cache: "no-store",
+      headers,
+      signal
+    });
+    if (!response.ok) throw new Error(`ChatGPT conversation metadata returned HTTP ${response.status}.`);
+    const conversation = await response.json();
+    throwIfCancelled(session);
+
+    const branch = collectChatGPTBranch(conversation);
+    notifyProgress({
+      percent: 30,
+      messageCount: 0,
+      imageCount: 0,
+      status: `Conversation received. Reading ${branch.length} stored turn${branch.length === 1 ? "" : "s"}...`,
+      running: true
+    });
+    const renderedBatch = await renderChatGPTMessageBatch(branch, {
+      context,
+      headers,
+      signal,
+      embedImages: options.embedImages !== false,
+      keyPrefix: "chatgpt:api",
+      progressStart: 30,
+      progressSpan: 52,
+      progressStatus: "Reading ChatGPT messages...",
+      skipEditableContext: false
+    });
+    const { messages, imageCount } = renderedBatch;
+
+    if (!messages.length) throw new Error("ChatGPT metadata was available, but no visible user/assistant messages were found.");
+    notifyProgress({
+      percent: 84,
+      messageCount: messages.length,
+      imageCount,
+      status: `Conversation data ready. ${messages.length} messages captured.`,
+      running: true
+    });
+    return {
+      messages,
+      imageCount,
+      processedMediaKeys: new Set(),
+      identityCollisions: 0,
+      title: cleanTitle(conversation.title || document.title, "ChatGPT") || "ChatGPT Conversation",
+      extractionSource: "metadata"
+    };
+  }
+
+  function collectScrollCandidates(messageNode, platformId = PLATFORM.id) {
+    const list = [];
+    const add = (node) => {
+      if (!node || list.includes(node)) return;
+      list.push(node);
+    };
+
+    let current = messageNode;
+    while (current && current !== document.body && current !== document.documentElement) {
+      if (current instanceof HTMLElement) {
+        const style = getComputedStyle(current);
+        const overflowY = style.overflowY;
+        if (scrollRange(current) > 24 || overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay") add(current);
+      }
+      current = current.parentElement;
+    }
+
+    if (platformId === "gemini") {
+      add(document.querySelector("#chat-history"));
+      add(document.querySelector(".chat-history-scroll-container"));
+      add(document.querySelector("infinite-scroller"));
+    }
+    add(document.querySelector("main"));
+    add(document.scrollingElement);
+    add(document.documentElement);
+    return list.filter(Boolean);
+  }
+
+  async function resolveConversationScrollContainer(messageNode, platformId, signal) {
+    const candidates = collectScrollCandidates(messageNode, platformId);
+    if (!candidates.length) return document.scrollingElement || document.documentElement;
+    let best = null;
+    let bestScore = -1;
+
+    for (const candidate of candidates) {
+      if (signal?.aborted) throw makeCancelledError();
+      const range = scrollRange(candidate);
+      if (range <= 2) continue;
+      const beforeTop = getScrollTop(candidate);
+      const beforeRect = messageNode?.getBoundingClientRect?.();
+      const delta = Math.min(180, Math.max(60, range * 0.08));
+      const target = beforeTop > Math.min(range * 0.5, delta + 5)
+        ? Math.max(0, beforeTop - delta)
+        : Math.min(range, beforeTop + delta);
+      setScrollTop(candidate, target);
+      await sleepWithAbort(70, signal);
+      const afterTop = getScrollTop(candidate);
+      const afterRect = messageNode?.getBoundingClientRect?.();
+      const topMotion = Math.abs(afterTop - beforeTop);
+      const rectMotion = beforeRect && afterRect ? Math.abs(afterRect.top - beforeRect.top) : 0;
+      setScrollTop(candidate, beforeTop);
+      await sleepWithAbort(20, signal);
+
+      const isDocument = candidate === document.scrollingElement || candidate === document.documentElement;
+      const score = Math.min(range, 100000) / 1000 + topMotion * 2 + rectMotion * 3 + (isDocument ? 1 : 0);
+      if ((topMotion > 2 || rectMotion > 2) && score > bestScore) {
+        best = candidate;
+        bestScore = score;
+      }
+    }
+
+    return best || candidates.find((node) => scrollRange(node) > 40) || document.scrollingElement || document.documentElement;
   }
 
   async function exportConversation(options, session) {
     throwIfCancelled(session);
     if (PLATFORM.id === "unsupported") throw new Error("This page is not supported by ChatFolio.");
-    const initialNodes = getMessageNodes();
-    if (!initialNodes.length) {
-      throw new Error(`No ${PLATFORM.name} conversation messages were found on this page. Open a conversation and try again.`);
+
+    // Manual Visual backup is deliberately provider-agnostic. Do not touch
+    // provider message nodes or typography before entering the screenshot path;
+    // this keeps the emergency escape hatch usable even after a radical layout
+    // redesign that breaks every semantic selector.
+    if (options.forceVisual) {
+      return await runVisualArchiveFallback(options, session, new Error("Visual backup was requested by the user."));
     }
 
-    const scrollContainer = PLATFORM.id === "gemini"
-      ? findGeminiScrollContainer(initialNodes[0])
-      : findConversationScrollContainer(initialNodes[0]);
-    const originalScrollTop = getScrollTop(scrollContainer);
-    const originalDistanceFromBottom = Math.max(0, getScrollHeight(scrollContainer) - getClientHeight(scrollContainer) - originalScrollTop);
-    const originalBehavior = scrollContainer?.style?.scrollBehavior;
-    const originalOverflowAnchor = scrollContainer?.style?.overflowAnchor;
-    const originalScrollSnapType = scrollContainer?.style?.scrollSnapType;
+    const sourceTypography = await detectSourceTypography(session.controller.signal);
+    session.sourceTypography = sourceTypography;
 
-    if (scrollContainer?.style) {
-      scrollContainer.style.scrollBehavior = "auto";
-      scrollContainer.style.overflowAnchor = "none";
-      scrollContainer.style.scrollSnapType = "none";
-    }
+    let collected = null;
+    let metadataFailure = null;
 
-    let collected;
     try {
-      collected = PLATFORM.id === "gemini"
-        ? await collectGeminiConversation(scrollContainer, options, session)
-        : await collectEntireConversation(scrollContainer, options, session);
-      throwIfCancelled(session);
-    } finally {
-      if (PLATFORM.id === "gemini") {
-        const restoreTop = Math.max(0, getScrollHeight(scrollContainer) - getClientHeight(scrollContainer) - originalDistanceFromBottom);
-        setScrollTop(scrollContainer, restoreTop);
-      } else {
-        setScrollTop(scrollContainer, originalScrollTop);
+      // ChatGPT is heavily virtualized and its DOM changes frequently. Prefer
+      // conversation/share data first; provider DOM scanning is the semantic
+      // fallback. If both stop working after a future redesign, the outer catch
+      // switches to a provider-agnostic visual archive instead of leaving the
+      // user without a PDF.
+      if (PLATFORM.id === "chatgpt") {
+        try {
+          collected = await collectChatGPTViaMetadata(options, session);
+        } catch (error) {
+          if (isCancelledError(error)) throw error;
+          metadataFailure = error;
+          console.info("ChatFolio: ChatGPT data extraction was unavailable; trying semantic DOM scanning.", error?.message || error);
+        }
       }
-      if (scrollContainer?.style) {
-        scrollContainer.style.scrollBehavior = originalBehavior || "";
-        scrollContainer.style.overflowAnchor = originalOverflowAnchor || "";
-        scrollContainer.style.scrollSnapType = originalScrollSnapType || "";
-      }
-    }
 
-    if (!collected.messages.length) {
-      throw new Error("The full-chat scan did not find any messages.");
+      if (!collected) {
+        const initialNodes = getMessageNodes();
+        if (!initialNodes.length) {
+          const diagnostics = collectDomDiagnostics();
+          const prefix = metadataFailure ? `ChatGPT data extraction also failed (${metadataFailure.message || metadataFailure}). ` : "";
+          throw new Error(`${prefix}No ${PLATFORM.name} conversation messages were found. ${diagnostics}`);
+        }
+
+        const scrollContainer = await resolveConversationScrollContainer(initialNodes[0], PLATFORM.id, session.controller.signal);
+        const originalScrollTop = getScrollTop(scrollContainer);
+        const originalDistanceFromBottom = Math.max(0, getScrollHeight(scrollContainer) - getClientHeight(scrollContainer) - originalScrollTop);
+        const originalBehavior = scrollContainer?.style?.scrollBehavior;
+        const originalOverflowAnchor = scrollContainer?.style?.overflowAnchor;
+        const originalScrollSnapType = scrollContainer?.style?.scrollSnapType;
+
+        if (scrollContainer?.style) {
+          scrollContainer.style.scrollBehavior = "auto";
+          scrollContainer.style.overflowAnchor = "none";
+          scrollContainer.style.scrollSnapType = "none";
+        }
+
+        try {
+          collected = PLATFORM.id === "gemini"
+            ? await collectGeminiConversation(scrollContainer, options, session)
+            : await collectEntireConversation(scrollContainer, options, session);
+          throwIfCancelled(session);
+        } catch (error) {
+          if (metadataFailure && PLATFORM.id === "chatgpt" && !isCancelledError(error)) {
+            throw new Error(`ChatGPT data extraction failed (${metadataFailure.message || metadataFailure}); semantic DOM fallback failed (${error.message || error}).`);
+          }
+          throw error;
+        } finally {
+          if (PLATFORM.id === "gemini") {
+            const restoreTop = Math.max(0, getScrollHeight(scrollContainer) - getClientHeight(scrollContainer) - originalDistanceFromBottom);
+            setScrollTop(scrollContainer, restoreTop);
+          } else {
+            setScrollTop(scrollContainer, originalScrollTop);
+          }
+          if (scrollContainer?.style) {
+            scrollContainer.style.scrollBehavior = originalBehavior || "";
+            scrollContainer.style.overflowAnchor = originalOverflowAnchor || "";
+            scrollContainer.style.scrollSnapType = originalScrollSnapType || "";
+          }
+        }
+      }
+
+      if (!collected?.messages?.length) throw new Error("The semantic full-chat collector did not find any messages.");
+    } catch (error) {
+      if (isCancelledError(error)) throw error;
+      console.warn(`ChatFolio: semantic ${PLATFORM.name} export failed; switching to visual archive fallback.`, error);
+      return await runVisualArchiveFallback(options, session, error);
     }
 
     notifyProgress({
@@ -338,56 +1608,845 @@
     });
     throwIfCancelled(session);
 
-    const title = getConversationTitle() || `${PLATFORM.name} Conversation`;
-    const printableHtml = buildPrintableDocument(
-      collected.messages,
-      title,
-      options,
-      collected.imageCount,
-      PLATFORM
-    );
-
-    throwIfCancelled(session);
-    const printWindow = window.open("", "_blank");
-    if (!printWindow) {
-      throw new Error("The browser blocked the print window. Allow pop-ups for this AI chat site and try again.");
+    const title = collected.title || getConversationTitle() || `${PLATFORM.name} Conversation`;
+    let printableHtml;
+    try {
+      printableHtml = buildPrintableDocument(
+        collected.messages,
+        title,
+        options,
+        collected.imageCount,
+        PLATFORM,
+        sourceTypography
+      );
+    } catch (error) {
+      if (isCancelledError(error)) throw error;
+      console.warn("ChatFolio: semantic print document construction failed; switching to visual archive fallback.", error);
+      return await runVisualArchiveFallback(options, session, error);
     }
 
-    try {
-      printWindow.history.replaceState(null, "", `${location.origin}/`);
-    } catch {}
-
-    printWindow.document.open();
-    printWindow.document.write(printableHtml);
-    printWindow.document.close();
-
-    notifyProgress({
-      percent: 97,
-      messageCount: collected.messages.length,
-      imageCount: collected.imageCount,
-      status: "Waiting for images and layout before printing...",
-      running: true
-    });
-
-    await waitForPrintDocument(printWindow);
     throwIfCancelled(session);
-
     notifyProgress({
       percent: 100,
       messageCount: collected.messages.length,
       imageCount: collected.imageCount,
-      status: "Full scan complete. Opening the print dialog...",
+      status: "Conversation ready. Opening the print dialog...",
       running: true
     });
+    await sleepWithAbort(320, session.controller.signal);
 
-    printWindow.focus();
-    printWindow.print();
+    await deliverPrintableDocument(printableHtml, title, session);
+    throwIfCancelled(session);
 
     return {
       messageCount: collected.messages.length,
       imageCount: collected.imageCount,
       platform: PLATFORM.id,
-      platformName: PLATFORM.name
+      platformName: PLATFORM.name,
+      fallbackMode: null
+    };
+  }
+
+  function isRootScrollNode(node) {
+    return node === document.scrollingElement || node === document.documentElement || node === document.body;
+  }
+
+  function emergencyScrollerScore(node) {
+    try {
+      const range = scrollRange(node);
+      if (range < 120) return -Infinity;
+      const viewportWidth = Math.max(1, window.innerWidth || 1);
+      const viewportHeight = Math.max(1, window.innerHeight || 1);
+      let rect;
+      if (isRootScrollNode(node)) {
+        rect = { left: 0, top: 0, right: viewportWidth, bottom: viewportHeight, width: viewportWidth, height: viewportHeight };
+      } else {
+        rect = node.getBoundingClientRect();
+      }
+      const width = Math.max(0, Math.min(viewportWidth, rect.right) - Math.max(0, rect.left));
+      const height = Math.max(0, Math.min(viewportHeight, rect.bottom) - Math.max(0, rect.top));
+      if (width < Math.min(280, viewportWidth * 0.28) || height < Math.min(240, viewportHeight * 0.35)) return -Infinity;
+
+      const areaRatio = (width * height) / (viewportWidth * viewportHeight);
+      const widthRatio = width / viewportWidth;
+      const centerX = Math.max(0, Math.min(viewportWidth, rect.left + rect.width / 2));
+      const centerAffinity = 1 - Math.min(1, Math.abs(centerX - viewportWidth / 2) / (viewportWidth / 2));
+      const style = isRootScrollNode(node) ? null : getComputedStyle(node);
+      const scrollStyleBonus = style && /auto|scroll|overlay/.test(style.overflowY || "") ? 6 : 0;
+      const mainBonus = node.matches?.('main,[role="main"]') || node.closest?.('main,[role="main"]') ? 7 : 0;
+      const sidePenalty = node.closest?.('nav,aside,[role="navigation"]') ? 24 : 0;
+      const rootBonus = isRootScrollNode(node) ? 2 : 0;
+      return Math.log2(range + 2) * 3.5 + areaRatio * 18 + widthRatio * 8 + centerAffinity * 7 + scrollStyleBonus + mainBonus + rootBonus - sidePenalty;
+    } catch {
+      return -Infinity;
+    }
+  }
+
+  function collectEmergencyElements(limit = 5000) {
+    const result = [];
+    const seen = new Set();
+    const stack = [];
+    if (document.documentElement) stack.push(document.documentElement);
+
+    while (stack.length && result.length < limit) {
+      const node = stack.pop();
+      if (!node || seen.has(node)) continue;
+      seen.add(node);
+      if (node instanceof HTMLElement) result.push(node);
+
+      // Open shadow roots are intentionally traversed here. The semantic adapters
+      // do not need to know about them, but an emergency visual archive should
+      // still be able to locate a future provider's scroll viewport if the UI is
+      // moved into web components. Closed shadow roots remain browser-inaccessible.
+      try {
+        if (node.shadowRoot) {
+          for (const child of node.shadowRoot.children || []) stack.push(child);
+        }
+      } catch {}
+      try {
+        for (let i = node.children?.length - 1; i >= 0; i -= 1) stack.push(node.children[i]);
+      } catch {}
+    }
+    return result;
+  }
+
+  function emergencyVisibleRect(node) {
+    const vw = Math.max(1, window.innerWidth || 1);
+    const vh = Math.max(1, window.innerHeight || 1);
+    if (isRootScrollNode(node)) return { left: 0, top: 0, right: vw, bottom: vh, width: vw, height: vh };
+    try {
+      const rect = node.getBoundingClientRect();
+      const left = Math.max(0, Math.min(vw, rect.left));
+      const top = Math.max(0, Math.min(vh, rect.top));
+      const right = Math.max(left, Math.min(vw, rect.right));
+      const bottom = Math.max(top, Math.min(vh, rect.bottom));
+      return { left, top, right, bottom, width: Math.max(0, right - left), height: Math.max(0, bottom - top) };
+    } catch {
+      return { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
+    }
+  }
+
+  function emergencyRectOverlapRatio(a, b) {
+    if (!a || !b || a.width <= 0 || a.height <= 0 || b.width <= 0 || b.height <= 0) return 0;
+    const left = Math.max(a.left, b.left);
+    const top = Math.max(a.top, b.top);
+    const right = Math.min(a.right, b.right);
+    const bottom = Math.min(a.bottom, b.bottom);
+    const area = Math.max(0, right - left) * Math.max(0, bottom - top);
+    return area / Math.max(1, Math.min(a.width * a.height, b.width * b.height));
+  }
+
+  function getEmergencyPrimaryRegion() {
+    const vw = Math.max(1, window.innerWidth || 1);
+    const vh = Math.max(1, window.innerHeight || 1);
+    let bestNode = null;
+    let bestRect = null;
+    let bestScore = -Infinity;
+
+    // Prefer large visible main-content regions when the provider exposes them,
+    // but do not depend on any provider-specific class names.
+    const candidates = [];
+    try { candidates.push(...document.querySelectorAll('main,[role="main"]')); } catch {}
+    for (const node of candidates) {
+      try {
+        const style = getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) <= 0.01) continue;
+        const rect = emergencyVisibleRect(node);
+        if (rect.width < vw * 0.38 || rect.height < vh * 0.42) continue;
+        const centerX = rect.left + rect.width / 2;
+        const centerAffinity = 1 - Math.min(1, Math.abs(centerX - vw / 2) / (vw / 2));
+        const score = rect.width * rect.height * (0.75 + centerAffinity * 0.25);
+        if (score > bestScore) {
+          bestScore = score;
+          bestNode = node;
+          bestRect = rect;
+        }
+      } catch {}
+    }
+
+    if (bestRect) return { node: bestNode, rect: bestRect };
+
+    // Provider-agnostic fallback: the central content band. Sidebars normally sit
+    // outside this region, so using it prevents the visual archive from scrolling
+    // a navigation panel while repeatedly capturing an unchanged conversation.
+    return {
+      node: null,
+      rect: { left: vw * 0.18, top: 0, right: vw, bottom: vh, width: vw * 0.82, height: vh }
+    };
+  }
+
+  function collectEmergencyCenterAncestors() {
+    const vw = Math.max(1, window.innerWidth || 1);
+    const vh = Math.max(1, window.innerHeight || 1);
+    const hits = new Map();
+    const xs = [0.36, 0.50, 0.64, 0.78];
+    const ys = [0.24, 0.44, 0.64, 0.78];
+
+    for (const xf of xs) {
+      for (const yf of ys) {
+        let node = null;
+        try { node = document.elementFromPoint(Math.round(vw * xf), Math.round(vh * yf)); } catch {}
+        let depth = 0;
+        while (node && depth < 18) {
+          if (node instanceof HTMLElement) hits.set(node, (hits.get(node) || 0) + 1);
+          if (node.parentElement) node = node.parentElement;
+          else {
+            try { node = node.getRootNode?.()?.host || null; } catch { node = null; }
+          }
+          depth += 1;
+        }
+      }
+    }
+    return hits;
+  }
+
+  async function probeEmergencyScroller(node, signal) {
+    if (!node || signal?.aborted) return false;
+    const range = scrollRange(node);
+    if (range < 120) return false;
+    const original = getScrollTop(node);
+    let target;
+    if (original < range * 0.72) target = Math.min(range, original + Math.max(140, Math.min(420, range * 0.12)));
+    else target = Math.max(0, original - Math.max(140, Math.min(420, range * 0.12)));
+    if (Math.abs(target - original) < 24) return false;
+
+    try {
+      setScrollTop(node, target);
+      await sleepWithAbort(85, signal);
+      const moved = Math.abs(getScrollTop(node) - original) >= 18;
+      setScrollTop(node, original);
+      await sleepWithAbort(45, signal);
+      return moved;
+    } catch (error) {
+      try { setScrollTop(node, original); } catch {}
+      if (isCancelledError(error)) throw error;
+      return false;
+    }
+  }
+
+  async function findEmergencyVisualScroller(session, excluded = new Set()) {
+    const vw = Math.max(1, window.innerWidth || 1);
+    const vh = Math.max(1, window.innerHeight || 1);
+    const primary = getEmergencyPrimaryRegion();
+    const centerHits = collectEmergencyCenterAncestors();
+    const candidates = [];
+    const seen = new Set();
+    const add = (node) => {
+      if (!node || seen.has(node) || excluded.has(node)) return;
+      seen.add(node);
+      candidates.push(node);
+    };
+
+    add(document.scrollingElement);
+    add(document.documentElement);
+    add(document.body);
+    for (const node of centerHits.keys()) add(node);
+    for (const node of collectEmergencyElements(5000)) add(node);
+
+    const ranked = [];
+    for (const node of candidates) {
+      const base = emergencyScrollerScore(node);
+      if (!Number.isFinite(base)) continue;
+      const rect = emergencyVisibleRect(node);
+      const isRoot = isRootScrollNode(node);
+      const overlap = isRoot ? 1 : emergencyRectOverlapRatio(rect, primary.rect);
+      const widthRatio = rect.width / vw;
+      const heightRatio = rect.height / vh;
+      const centerHitBonus = (centerHits.get(node) || 0) * 5.5;
+      const primaryContainment = primary.node && (node === primary.node || node.contains?.(primary.node) || primary.node.contains?.(node)) ? 16 : 0;
+
+      // A narrow sidebar can have an enormous scroll range and used to beat the
+      // real conversation scroller. Non-root candidates must now occupy a large
+      // central region or substantially overlap the main content region.
+      if (!isRoot && widthRatio < 0.42 && overlap < 0.68) continue;
+      if (!isRoot && heightRatio < 0.42) continue;
+      if (!isRoot && overlap < 0.34 && (centerHits.get(node) || 0) < 2) continue;
+
+      const score = base + overlap * 42 + Math.min(1, widthRatio) * 10 + centerHitBonus + primaryContainment;
+      ranked.push({ node, score, overlap, centerHits: centerHits.get(node) || 0 });
+    }
+
+    ranked.sort((a, b) => b.score - a.score);
+    for (const item of ranked.slice(0, 18)) {
+      throwIfCancelled(session);
+      if (await probeEmergencyScroller(item.node, session.controller.signal)) return item.node;
+    }
+
+    // If the page itself is not currently scrollable, return the highest-ranked
+    // candidate anyway so callers can produce a one-viewport emergency archive.
+    return ranked[0]?.node || document.scrollingElement || document.documentElement;
+  }
+
+  function clampCaptureRect(rect) {
+    const vw = Math.max(1, window.innerWidth || 1);
+    const vh = Math.max(1, window.innerHeight || 1);
+    const left = Math.max(0, Math.min(vw, Number(rect?.left || 0)));
+    const top = Math.max(0, Math.min(vh, Number(rect?.top || 0)));
+    const right = Math.max(left, Math.min(vw, Number(rect?.right ?? vw)));
+    const bottom = Math.max(top, Math.min(vh, Number(rect?.bottom ?? vh)));
+    return { left, top, width: Math.max(1, right - left), height: Math.max(1, bottom - top) };
+  }
+
+  function getEmergencyCaptureRect(scroller) {
+    const vw = Math.max(1, window.innerWidth || 1);
+    const vh = Math.max(1, window.innerHeight || 1);
+    const primary = getEmergencyPrimaryRegion();
+
+    if (!isRootScrollNode(scroller)) {
+      const rect = clampCaptureRect(scroller.getBoundingClientRect());
+      const overlap = emergencyRectOverlapRatio(
+        { left: rect.left, top: rect.top, right: rect.left + rect.width, bottom: rect.top + rect.height, width: rect.width, height: rect.height },
+        primary.rect
+      );
+      if (rect.width >= vw * 0.42 && rect.height >= vh * 0.45 && overlap >= 0.38) return rect;
+    }
+
+    if (primary?.rect) return clampCaptureRect(primary.rect);
+    return { left: 0, top: 0, width: vw, height: vh };
+  }
+
+  function loadDataUrlImage(dataUrl, signal) {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) return reject(makeCancelledError());
+      const img = new Image();
+      const cleanup = () => signal?.removeEventListener?.("abort", onAbort);
+      const onAbort = () => { cleanup(); reject(makeCancelledError()); };
+      signal?.addEventListener?.("abort", onAbort, { once: true });
+      img.onload = () => { cleanup(); resolve(img); };
+      img.onerror = () => { cleanup(); reject(new Error("Could not decode a captured viewport image.")); };
+      img.src = dataUrl;
+    });
+  }
+
+  async function cropEmergencyCapture(dataUrl, rect, signal) {
+    const vw = Math.max(1, window.innerWidth || 1);
+    const vh = Math.max(1, window.innerHeight || 1);
+    const safe = clampCaptureRect(rect);
+    const nearFull = safe.left <= 2 && safe.top <= 2 && safe.width >= vw - 4 && safe.height >= vh - 4;
+    if (nearFull) return dataUrl;
+
+    try {
+      const img = await loadDataUrlImage(dataUrl, signal);
+      const scaleX = img.naturalWidth / vw;
+      const scaleY = img.naturalHeight / vh;
+      const sx = Math.max(0, Math.round(safe.left * scaleX));
+      const sy = Math.max(0, Math.round(safe.top * scaleY));
+      const sw = Math.max(1, Math.min(img.naturalWidth - sx, Math.round(safe.width * scaleX)));
+      const sh = Math.max(1, Math.min(img.naturalHeight - sy, Math.round(safe.height * scaleY)));
+      const maxWidth = 1500;
+      const outputScale = Math.min(1, maxWidth / sw);
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(sw * outputScale));
+      canvas.height = Math.max(1, Math.round(sh * outputScale));
+      const ctx = canvas.getContext("2d", { alpha: false });
+      if (!ctx) return dataUrl;
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+      return canvas.toDataURL("image/jpeg", 0.78);
+    } catch (error) {
+      if (isCancelledError(error)) throw error;
+      return dataUrl;
+    }
+  }
+
+  async function captureEmergencyViewport(scroller, session) {
+    throwIfCancelled(session);
+    const response = await sendRuntimeMessage({ type: "CHATFOLIO_CAPTURE_VISIBLE", quality: 80 });
+    if (!response?.ok || !response?.dataUrl) throw new Error(response?.error || "Chrome could not capture the conversation viewport.");
+    const rect = getEmergencyCaptureRect(scroller);
+    return await cropEmergencyCapture(response.dataUrl, rect, session.controller.signal);
+  }
+
+  async function settleEmergencyTop(scroller, session) {
+    const signal = session.controller.signal;
+    let lastHeight = -1;
+    let stableRounds = 0;
+    const started = Date.now();
+    for (let round = 0; round < 18 && stableRounds < 3 && Date.now() - started < 18000; round += 1) {
+      throwIfCancelled(session);
+      setScrollTop(scroller, 0);
+      await sleepWithAbort(round < 3 ? 650 : 900, signal);
+      const height = getScrollHeight(scroller);
+      const top = getScrollTop(scroller);
+      if (Math.abs(height - lastHeight) <= 12 && top <= 24) stableRounds += 1;
+      else stableRounds = 0;
+      lastHeight = height;
+    }
+    setScrollTop(scroller, 0);
+    await sleepWithAbort(500, signal);
+  }
+
+  function emergencyFrameSignature(dataUrl) {
+    const value = String(dataUrl || "");
+    if (!value) return "";
+    return `${value.length}:${simpleHash(value.slice(0, 1800) + value.slice(-1800))}`;
+  }
+
+  async function captureEmergencyScrollerSequence(scroller, session) {
+    const signal = session.controller.signal;
+    const originalTop = getScrollTop(scroller);
+    const originalBehavior = scroller?.style?.scrollBehavior;
+    const originalOverflowAnchor = scroller?.style?.overflowAnchor;
+    const originalScrollSnapType = scroller?.style?.scrollSnapType;
+    if (scroller?.style) {
+      scroller.style.scrollBehavior = "auto";
+      scroller.style.overflowAnchor = "none";
+      scroller.style.scrollSnapType = "none";
+    }
+
+    const frames = [];
+    let encodedChars = 0;
+    let lastSignature = "";
+    let stagnant = 0;
+    let minTop = Infinity;
+    let maxTop = -Infinity;
+    const maxFrames = 1200;
+    const maxEncodedChars = 190 * 1024 * 1024;
+
+    try {
+      await settleEmergencyTop(scroller, session);
+      let viewport = Math.max(260, getClientHeight(scroller));
+      let step = Math.max(220, Math.floor(viewport * 0.88));
+      let target = 0;
+      let lastActualTop = -1;
+
+      while (frames.length < maxFrames && encodedChars < maxEncodedChars) {
+        throwIfCancelled(session);
+        const range = Math.max(0, scrollRange(scroller));
+        const clampedTarget = Math.min(range, Math.max(0, target));
+        setScrollTop(scroller, clampedTarget);
+        await sleepWithAbort(frames.length < 2 ? 620 : 360, signal);
+        const actualTop = getScrollTop(scroller);
+        minTop = Math.min(minTop, actualTop);
+        maxTop = Math.max(maxTop, actualTop);
+
+        const frame = await captureEmergencyViewport(scroller, session);
+        const signature = emergencyFrameSignature(frame);
+        if (signature && signature !== lastSignature) {
+          frames.push(frame);
+          encodedChars += frame.length;
+          lastSignature = signature;
+          stagnant = 0;
+        } else {
+          stagnant += 1;
+        }
+
+        const currentRange = Math.max(0, scrollRange(scroller));
+        const percent = currentRange > 0
+          ? Math.min(91, 10 + Math.round((actualTop / currentRange) * 80))
+          : 90;
+        notifyProgress({ percent, messageCount: 0, imageCount: frames.length, status: "Creating a visual backup of the full conversation...", running: true });
+
+        const atBottom = currentRange <= 8 || actualTop >= currentRange - 8;
+        if (atBottom) {
+          await sleepWithAbort(560, signal);
+          const grownRange = Math.max(0, scrollRange(scroller));
+          if (grownRange <= currentRange + 12) break;
+        }
+
+        // If setting scrollTop has no effect, this is almost certainly a false
+        // scroller candidate (for example a sidebar or wrapper). Stop this pass so
+        // the caller can rediscover another candidate instead of producing a PDF
+        // with the same viewport repeated twice.
+        if (lastActualTop >= 0 && clampedTarget > lastActualTop + 80 && actualTop <= lastActualTop + 8) {
+          stagnant += 3;
+        }
+        if (stagnant >= 4 && Math.abs(actualTop - lastActualTop) < 12) break;
+
+        lastActualTop = actualTop;
+        viewport = Math.max(260, getClientHeight(scroller));
+        step = Math.max(220, Math.floor(viewport * 0.88));
+        target = actualTop + step;
+      }
+
+      return {
+        frames,
+        movement: Number.isFinite(minTop) && Number.isFinite(maxTop) ? Math.max(0, maxTop - minTop) : 0,
+        range: Math.max(0, scrollRange(scroller)),
+        viewport: Math.max(260, getClientHeight(scroller))
+      };
+    } finally {
+      setScrollTop(scroller, originalTop);
+      if (scroller?.style) {
+        scroller.style.scrollBehavior = originalBehavior || "";
+        scroller.style.overflowAnchor = originalOverflowAnchor || "";
+        scroller.style.scrollSnapType = originalScrollSnapType || "";
+      }
+    }
+  }
+
+  function assistedVisualOverlay(session) {
+    const existing = document.querySelector('[data-chatfolio-visual-overlay="1"]');
+    if (existing) existing.remove();
+
+    const host = document.createElement('div');
+    host.setAttribute('data-chatfolio-visual-overlay', '1');
+    host.style.position = 'fixed';
+    host.style.inset = '0';
+    host.style.zIndex = '2147483647';
+    host.style.pointerEvents = 'none';
+    document.documentElement.appendChild(host);
+
+    const shadow = host.attachShadow({ mode: 'open' });
+    shadow.innerHTML = `
+      <style>
+        :host { all: initial; }
+        * { box-sizing: border-box; }
+        .panel {
+          position: fixed;
+          right: 18px;
+          bottom: 18px;
+          width: min(410px, calc(100vw - 36px));
+          font-family: Arial, sans-serif;
+          color: #171717;
+          background: rgba(255,255,255,.97);
+          border: 1px solid rgba(17,24,39,.18);
+          border-radius: 14px;
+          box-shadow: 0 18px 48px rgba(0,0,0,.24);
+          padding: 15px;
+          pointer-events: auto;
+          backdrop-filter: blur(10px);
+        }
+        .title { font-size: 15px; font-weight: 700; margin: 0 0 7px; }
+        .body { font-size: 12.5px; line-height: 1.45; color: #374151; margin: 0 0 11px; }
+        .status { font-size: 12px; line-height: 1.4; color: #111827; margin: 8px 0 10px; min-height: 17px; }
+        .counter { display: inline-flex; align-items: center; gap: 5px; margin-bottom: 8px; padding: 4px 8px; border-radius: 999px; background: #f3f4f6; font-size: 11px; color: #374151; }
+        .row { display: flex; gap: 8px; flex-wrap: wrap; }
+        button {
+          appearance: none; border: 0; border-radius: 9px; padding: 9px 11px;
+          font: 600 12px/1 Arial, sans-serif; cursor: pointer;
+        }
+        button.primary { background: #111827; color: #fff; }
+        button.secondary { background: #eef0f3; color: #111827; }
+        button.danger { background: #fff0f0; color: #a11; }
+        button:disabled { opacity: .48; cursor: default; }
+        .tiny { font-size: 10.5px; color: #6b7280; margin-top: 9px; line-height: 1.35; }
+      </style>
+      <section class="panel" role="dialog" aria-label="ChatFolio visual backup">
+        <div class="title">ChatFolio Visual Backup</div>
+        <div class="body" data-body>
+          Go to the <strong>beginning of the conversation</strong> using the page normally. Then click <strong>Start capture</strong>.
+          After that, scroll downward at a normal, steady pace. ChatFolio will capture the visible conversation while you scroll.
+        </div>
+        <div class="counter" data-counter hidden>0 unique views captured</div>
+        <div class="status" data-status>Waiting for you to reach the beginning of the chat.</div>
+        <div class="row" data-before>
+          <button class="primary" data-start>Start capture</button>
+          <button class="danger" data-cancel>Cancel</button>
+        </div>
+        <div class="row" data-during hidden>
+          <button class="secondary" data-capture>Capture current view</button>
+          <button class="primary" data-finish>Finish & create PDF</button>
+          <button class="danger" data-cancel2>Cancel</button>
+        </div>
+        <div class="tiny" data-tip>
+          Best results: scroll in one direction, about one screen at a time. Pause briefly if you move quickly. Duplicate views are ignored automatically.
+        </div>
+      </section>`;
+
+    const q = (selector) => shadow.querySelector(selector);
+    return {
+      host,
+      shadow,
+      body: q('[data-body]'),
+      counter: q('[data-counter]'),
+      status: q('[data-status]'),
+      before: q('[data-before]'),
+      during: q('[data-during]'),
+      start: q('[data-start]'),
+      capture: q('[data-capture]'),
+      finish: q('[data-finish]'),
+      cancel: q('[data-cancel]'),
+      cancel2: q('[data-cancel2]'),
+      remove() { try { host.remove(); } catch {} },
+      hideForCapture() { host.style.visibility = 'hidden'; },
+      showAfterCapture() { host.style.visibility = 'visible'; },
+      setStatus(text) { q('[data-status]').textContent = String(text || ''); },
+      setCount(count) {
+        const el = q('[data-counter]');
+        el.hidden = false;
+        el.textContent = `${count} unique view${count === 1 ? '' : 's'} captured`;
+      },
+      enterCaptureMode() {
+        q('[data-before]').hidden = true;
+        q('[data-during]').hidden = false;
+        q('[data-counter]').hidden = false;
+        q('[data-body]').innerHTML = 'Scroll downward normally. ChatFolio captures during real user scrolling. Use <strong>Capture current view</strong> any time you want to force a frame.';
+      }
+    };
+  }
+
+  async function assistedVisualFingerprint(dataUrl, signal) {
+    try {
+      const img = await loadDataUrlImage(dataUrl, signal);
+      const canvas = document.createElement('canvas');
+      canvas.width = 28;
+      canvas.height = 18;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true, alpha: false });
+      if (!ctx) return null;
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const rgba = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+      const values = new Uint8Array(canvas.width * canvas.height);
+      for (let i = 0, j = 0; i < rgba.length; i += 4, j += 1) {
+        values[j] = Math.round(rgba[i] * 0.299 + rgba[i + 1] * 0.587 + rgba[i + 2] * 0.114);
+      }
+      return values;
+    } catch (error) {
+      if (isCancelledError(error)) throw error;
+      return null;
+    }
+  }
+
+  function assistedFingerprintDistance(a, b) {
+    if (!a || !b || a.length !== b.length || !a.length) return 1;
+    let total = 0;
+    for (let i = 0; i < a.length; i += 1) total += Math.abs(a[i] - b[i]);
+    return total / (a.length * 255);
+  }
+
+  async function captureAssistedVisualViewport(session, overlay) {
+    throwIfCancelled(session);
+    overlay?.hideForCapture();
+    try {
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const response = await sendRuntimeMessage({ type: 'CHATFOLIO_CAPTURE_VISIBLE', quality: 80 });
+      if (!response?.ok || !response?.dataUrl) throw new Error(response?.error || 'Chrome could not capture the current conversation view.');
+      const primary = getEmergencyPrimaryRegion();
+      const rect = primary?.rect ? clampCaptureRect(primary.rect) : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+      return await cropEmergencyCapture(response.dataUrl, rect, session.controller.signal);
+    } finally {
+      overlay?.showAfterCapture();
+    }
+  }
+
+  async function captureWholeConversationAssisted(session) {
+    notifyProgress({ percent: 7, messageCount: 0, imageCount: 0, status: 'Waiting for assisted visual backup...', running: true });
+    const overlay = assistedVisualOverlay(session);
+    const signal = session.controller.signal;
+    const frames = [];
+    const fingerprints = [];
+    const maxFrames = 1200;
+    const maxEncodedChars = 190 * 1024 * 1024;
+    let encodedChars = 0;
+    let started = false;
+    let captureInFlight = null;
+    let lastCaptureAt = 0;
+    let lastActivityAt = 0;
+    let activitySinceCapture = false;
+    let activityEvents = 0;
+    let timer = null;
+    let settled = false;
+
+    const cleanupFns = [];
+    const on = (target, type, handler, options) => {
+      target.addEventListener(type, handler, options);
+      cleanupFns.push(() => target.removeEventListener(type, handler, options));
+    };
+
+    const updateProgress = () => {
+      const count = frames.length;
+      overlay.setCount(count);
+      const percent = Math.min(90, 10 + Math.round(Math.min(1, count / 24) * 75));
+      notifyProgress({ percent, messageCount: 0, imageCount: count, status: 'Assisted visual backup is capturing the conversation...', running: true });
+    };
+
+    const addCurrentFrame = async (reason = 'auto') => {
+      if (!started || settled) return false;
+      if (captureInFlight) return captureInFlight;
+      if (frames.length >= maxFrames || encodedChars >= maxEncodedChars) {
+        overlay.setStatus('Capture limit reached. Finish the PDF now.');
+        return false;
+      }
+
+      const task = (async () => {
+        try {
+          overlay.capture.disabled = true;
+          overlay.finish.disabled = true;
+          overlay.setStatus(reason === 'manual' ? 'Capturing this view…' : 'Capturing…');
+          const frame = await captureAssistedVisualViewport(session, overlay);
+          const fingerprint = await assistedVisualFingerprint(frame, signal);
+          const exact = emergencyFrameSignature(frame);
+          const previousExact = frames.length ? emergencyFrameSignature(frames[frames.length - 1]) : '';
+          const distance = fingerprints.length ? assistedFingerprintDistance(fingerprint, fingerprints[fingerprints.length - 1]) : 1;
+          const duplicate = Boolean(frames.length && (exact === previousExact || distance < 0.006));
+          if (!duplicate) {
+            frames.push(frame);
+            fingerprints.push(fingerprint);
+            encodedChars += frame.length;
+            overlay.setStatus(`Captured view ${frames.length}. Keep scrolling downward.`);
+            updateProgress();
+          } else {
+            overlay.setStatus('Same view detected and ignored. Scroll farther before the next capture.');
+          }
+          lastCaptureAt = Date.now();
+          activitySinceCapture = false;
+          return !duplicate;
+        } finally {
+          if (!settled) {
+            overlay.capture.disabled = false;
+            overlay.finish.disabled = false;
+          }
+        }
+      })();
+      captureInFlight = task;
+      try { return await task; } finally { captureInFlight = null; }
+    };
+
+    const markActivity = () => {
+      if (!started || settled) return;
+      activityEvents += 1;
+      activitySinceCapture = true;
+      lastActivityAt = Date.now();
+    };
+
+    const onKey = (event) => {
+      const key = String(event?.key || '');
+      if (['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', 'Home', 'End', ' '].includes(key)) markActivity();
+    };
+
+    on(document, 'scroll', markActivity, true);
+    on(window, 'wheel', markActivity, { passive: true, capture: true });
+    on(window, 'touchmove', markActivity, { passive: true, capture: true });
+    on(window, 'keydown', onKey, true);
+
+    const dispose = () => {
+      settled = true;
+      if (timer) clearInterval(timer);
+      for (const fn of cleanupFns.splice(0)) { try { fn(); } catch {} }
+      overlay.remove();
+    };
+
+    const abortPromise = new Promise((_, reject) => {
+      const onAbort = () => reject(makeCancelledError());
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+      cleanupFns.push(() => signal.removeEventListener('abort', onAbort));
+    });
+
+    const userPromise = new Promise((resolve, reject) => {
+      overlay.start.addEventListener('click', async () => {
+        if (started || settled) return;
+        started = true;
+        overlay.enterCaptureMode();
+        overlay.setCount(0);
+        overlay.setStatus('Capturing the first view…');
+        try {
+          await addCurrentFrame('manual');
+          overlay.setStatus('First view captured. Scroll downward normally.');
+        } catch (error) {
+          reject(error);
+        }
+      });
+
+      overlay.capture.addEventListener('click', () => {
+        addCurrentFrame('manual').catch(reject);
+      });
+
+      overlay.finish.addEventListener('click', async () => {
+        if (!started || settled) return;
+        try {
+          if (activitySinceCapture && Date.now() - lastCaptureAt > 650) await addCurrentFrame('manual');
+          if (!frames.length) {
+            overlay.setStatus('No view has been captured yet. Scroll to the beginning and start capture first.');
+            return;
+          }
+          if (activityEvents >= 4 && frames.length < 3) {
+            overlay.setStatus('Only a few distinct views were captured. Continue scrolling through the chat before finishing.');
+            return;
+          }
+          resolve({ frames: [...frames], scrollerDescription: 'assisted user scrolling' });
+        } catch (error) {
+          reject(error);
+        }
+      });
+
+      const cancel = () => {
+        session.cancelled = true;
+        try { session.controller.abort(); } catch {}
+      };
+      overlay.cancel.addEventListener('click', cancel);
+      overlay.cancel2.addEventListener('click', cancel);
+    });
+
+    timer = setInterval(() => {
+      if (!started || settled || !activitySinceCapture || captureInFlight) return;
+      const now = Date.now();
+      const sinceCapture = now - lastCaptureAt;
+      const sinceActivity = now - lastActivityAt;
+      // Capture after a short pause, or periodically during continuous real
+      // scrolling. The background worker enforces Chrome's hard API quota too.
+      if (sinceCapture >= 800 && (sinceActivity >= 160 || sinceCapture >= 1250)) {
+        addCurrentFrame('auto').catch(() => {});
+      }
+    }, 180);
+
+    try {
+      const result = await Promise.race([userPromise, abortPromise]);
+      if (captureInFlight) await captureInFlight.catch(() => {});
+      return result;
+    } finally {
+      dispose();
+    }
+  }
+
+  async function captureWholeConversationVisually(session) {
+    // v1.8.0 intentionally uses real user scrolling for the emergency archive.
+    // Modern chat UIs can virtualize history in ways that ignore programmatic
+    // scrollTop changes, so a fully automatic screenshot crawler can repeatedly
+    // capture the same viewport while believing it moved. Assisted mode removes
+    // that dependency and refuses to silently finish after only duplicate frames.
+    return await captureWholeConversationAssisted(session);
+  }
+
+  function buildVisualArchiveDocument(frames, title) {
+    const imageHtml = frames.map((src, index) => `\n      <section class="visual-page"><img src="${src}" alt="Conversation visual capture ${index + 1}"></section>`).join("");
+    return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<style>
+  @page { size: A4; margin: 7mm; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #fff; color: #171717; font-family: Arial, sans-serif; }
+  .fallback-note { margin: 0 0 5mm; padding: 3mm 4mm; border: 1px solid #d9dde2; border-radius: 7px; background: #f7f8f9; font-size: 9pt; line-height: 1.45; }
+  .fallback-note strong { display: block; margin-bottom: 1mm; }
+  .fallback-reason { color: #6b7280; font-size: 7.5pt; overflow-wrap: anywhere; }
+  .visual-page { margin: 0; padding: 0; break-after: page; page-break-after: always; text-align: center; }
+  .visual-page:last-child { break-after: auto; page-break-after: auto; }
+  .visual-page img { display: block; width: 100%; height: auto; max-width: 100%; margin: 0 auto; object-fit: contain; }
+  @media print { body { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
+</style>
+</head>
+<body>
+  <div class="fallback-note">
+    <strong>${escapeHtml(title)} — visual archive fallback</strong>
+    <div>This PDF was created from visual captures collected while the conversation was scrolled in the browser. The archive prioritizes completeness over selectable text.</div>
+  </div>${imageHtml}
+</body>
+</html>`;
+  }
+
+  async function runVisualArchiveFallback(options, session, semanticFailure) {
+    throwIfCancelled(session);
+    notifyProgress({ percent: 5, messageCount: 0, imageCount: 0, status: "Opening assisted visual backup...", running: true });
+    const title = getConversationTitle() || `${PLATFORM.name} Conversation`;
+    const captured = await captureWholeConversationVisually(session);
+    throwIfCancelled(session);
+    notifyProgress({ percent: 94, messageCount: 0, imageCount: captured.frames.length, status: "Building visual archive PDF...", running: true });
+    const html = buildVisualArchiveDocument(captured.frames, title);
+    notifyProgress({ percent: 100, messageCount: 0, imageCount: captured.frames.length, status: "Visual archive ready. Opening the print dialog...", running: true });
+    await sleepWithAbort(280, session.controller.signal);
+    await deliverPrintableDocument(html, title, session);
+    throwIfCancelled(session);
+    return {
+      messageCount: 0,
+      imageCount: captured.frames.length,
+      platform: PLATFORM.id,
+      platformName: PLATFORM.name,
+      fallbackMode: "visual"
     };
   }
 
@@ -614,18 +2673,39 @@
       running: true
     });
 
-    let previousHeight = -1;
+    // ChatGPT and Claude can prepend older virtualized turns after scrollTop reaches
+    // zero. Height alone is not a sufficient signal because some rollouts recycle a
+    // fixed-height virtual list. Also track the first visible authored message.
+    const topLoadStartedAt = Date.now();
+    let previousTopSignature = "";
     let stableTopRounds = 0;
-    for (let i = 0; i < 8 && stableTopRounds < 2; i += 1) {
+    let topLoadRounds = 0;
+    while (stableTopRounds < 3 && topLoadRounds < 40 && Date.now() - topLoadStartedAt < 25000) {
       throwIfCancelled(session);
       assertSameConversation(session);
       setScrollTop(scrollContainer, 0);
-      await sleepWithAbort(420, signal);
-      const currentHeight = getScrollHeight(scrollContainer);
-      const atTop = getScrollTop(scrollContainer) <= 3;
-      if (atTop && Math.abs(currentHeight - previousHeight) < 3) stableTopRounds += 1;
+      await sleepWithAbort(520, signal);
+
+      const currentNodes = dedupeNestedMessages(getMessageNodes());
+      const firstNode = currentNodes.length ? currentNodes[0] : null;
+      const firstText = normalizeText(firstNode?.innerText || firstNode?.textContent || "").slice(0, 180);
+      const currentHeight = Math.round(getScrollHeight(scrollContainer));
+      const atTop = getScrollTop(scrollContainer) <= 4;
+      const signature = `${currentHeight}|${currentNodes.length}|${simpleHash(firstText)}`;
+      if (atTop && signature === previousTopSignature) stableTopRounds += 1;
       else stableTopRounds = 0;
-      previousHeight = currentHeight;
+      previousTopSignature = signature;
+      topLoadRounds += 1;
+
+      if (topLoadRounds % 3 === 0) {
+        notifyProgress({
+          percent: 4,
+          messageCount: messages.size,
+          imageCount,
+          status: `Checking for earlier ${PLATFORM.name} messages...`,
+          running: true
+        });
+      }
     }
 
     let lastGrowthAt = Date.now();
@@ -830,7 +2910,7 @@
   function recordSnapshotOrder(snapshotKeys, edges) {
     const compact = [];
     for (const key of snapshotKeys) {
-      if (!key || compact.at(-1) === key) continue;
+      if (!key || compact[compact.length - 1] === key) continue;
       compact.push(key);
     }
     for (let i = 0; i < compact.length - 1; i += 1) {
@@ -966,7 +3046,8 @@
   }
 
   function lastMessageNearViewportEnd(nodes, scrollContainer) {
-    const last = [...nodes].filter(Boolean).at(-1);
+    const filtered = [...nodes].filter(Boolean);
+    const last = filtered.length ? filtered[filtered.length - 1] : null;
     if (!last?.getBoundingClientRect) return false;
     const rect = last.getBoundingClientRect();
     const containerRect = scrollContainer && scrollContainer !== document.documentElement && scrollContainer !== document.body
@@ -1108,21 +3189,24 @@
       "style",
       "noscript",
       "[contenteditable='true']",
-      "[aria-hidden='true']:not(:has(img)):not(:has(picture))",
       "[data-testid*='copy']",
       "[data-testid*='thumb']",
       "[data-testid*='feedback']",
       "[data-testid*='action-button']",
       "[class*='turn-action']",
-      ".sr-only"
+      ".sr-only",
+      ".cdk-visually-hidden"
     ];
 
     clone.querySelectorAll(selectorsToRemove.join(",")).forEach((node) => node.remove());
-    clone.querySelectorAll("[aria-hidden='true']").forEach((node) => node.removeAttribute("aria-hidden"));
+    clone.querySelectorAll("[aria-hidden='true']").forEach((node) => {
+      if (node.querySelector?.("img, picture")) node.removeAttribute("aria-hidden");
+      else node.remove();
+    });
 
     // Remove provider action bars and screen-reader-only turn labels that are UI,
     // not authored conversation content.
-    clone.querySelectorAll("[data-message-action-bar], [role='toolbar'], [data-testid='action-bar-copy'], .sr-only").forEach((node) => node.remove());
+    clone.querySelectorAll("[data-message-action-bar], [role='toolbar'], [data-testid='action-bar-copy'], .sr-only, .cdk-visually-hidden").forEach((node) => node.remove());
     cleanupProviderArtifacts(clone, role, source);
 
     const allCloneNodes = [...clone.querySelectorAll("*")];
@@ -1175,10 +3259,8 @@
       const text = normalizeText(node.textContent || "");
       if (text.length < 2) return;
 
-      const replacement = document.createElement("div");
-      replacement.className = "export-writing-block";
-      replacement.innerHTML = node.innerHTML;
-      node.replaceWith(replacement);
+      node.removeAttribute("contenteditable");
+      node.classList.add("export-writing-block");
     });
   }
 
@@ -1189,38 +3271,37 @@
     for (let i = 0; i < Math.min(sourceFrames.length, cloneFrames.length); i += 1) {
       const sourceFrame = sourceFrames[i];
       const cloneFrame = cloneFrames[i];
-      let html = "";
-      let text = "";
+      let replacement = null;
 
       try {
         const body = sourceFrame.contentDocument?.body;
-        if (body) {
-          html = body.innerHTML || "";
-          text = normalizeText(body.innerText || body.textContent || "");
+        const text = normalizeText(body?.innerText || body?.textContent || "");
+        if (body && text.length >= 2) {
+          const imported = document.importNode(body, true);
+          imported.removeAttribute?.("id");
+          imported.classList?.add("export-writing-block", "export-embedded-frame");
+          replacement = imported;
         }
       } catch {
-        // Cross-origin frames cannot be inspected. Fall back to srcdoc below.
+        // Cross-origin frames cannot be inspected.
       }
 
-      if (!text) {
+      if (!replacement) {
         const srcdoc = sourceFrame.getAttribute("srcdoc") || "";
-        if (srcdoc) {
-          try {
-            const parsed = new DOMParser().parseFromString(srcdoc, "text/html");
-            html = parsed.body?.innerHTML || "";
-            text = normalizeText(parsed.body?.textContent || "");
-          } catch {
-            // Ignore malformed srcdoc.
-          }
+        const text = normalizeText(
+          srcdoc
+            .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+            .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+            .replace(/<[^>]+>/g, " ")
+        );
+        if (text.length >= 2) {
+          replacement = document.createElement("div");
+          replacement.className = "export-writing-block export-embedded-frame";
+          replacement.textContent = text;
         }
       }
 
-      if (text.length >= 2 && html) {
-        const replacement = document.createElement("div");
-        replacement.className = "export-writing-block export-embedded-frame";
-        replacement.innerHTML = html;
-        cloneFrame.replaceWith(replacement);
-      }
+      if (replacement) cloneFrame.replaceWith(replacement);
     }
   }
 
@@ -2018,7 +4099,354 @@
     return cleanTitle(document.title, PLATFORM.name);
   }
 
-  function buildPrintableDocument(messages, title, options, totalImageCount, platform) {
+  function sanitizeFontFamily(value) {
+    return String(value || "")
+      .replace(/[{};<>\n\r]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 320);
+  }
+
+  function isVisibleTypographyNode(node) {
+    if (!(node instanceof HTMLElement)) return false;
+    const rect = node.getBoundingClientRect?.();
+    if (!rect || rect.width < 8 || rect.height < 8) return false;
+    const style = getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity || 1) === 0) return false;
+    return true;
+  }
+
+  function directTextLength(node) {
+    let length = 0;
+    for (const child of node?.childNodes || []) {
+      if (child.nodeType === Node.TEXT_NODE) length += normalizeText(child.textContent || "").length;
+    }
+    return length;
+  }
+
+  function unquoteFontFamily(value) {
+    return String(value || "")
+      .trim()
+      .replace(/^['\"]|['\"]$/g, "")
+      .trim();
+  }
+
+  function splitFontFamilies(value) {
+    const raw = String(value || "");
+    const parts = [];
+    let current = "";
+    let quote = "";
+    for (const ch of raw) {
+      if ((ch === '"' || ch === "'") && (!quote || quote === ch)) {
+        quote = quote ? "" : ch;
+        current += ch;
+        continue;
+      }
+      if (ch === "," && !quote) {
+        if (current.trim()) parts.push(unquoteFontFamily(current));
+        current = "";
+        continue;
+      }
+      current += ch;
+    }
+    if (current.trim()) parts.push(unquoteFontFamily(current));
+    return parts.filter(Boolean);
+  }
+
+  function cssQuoteFamily(value) {
+    const family = unquoteFontFamily(value).replace(/[\\\"\n\r]/g, " ").trim();
+    return family ? `"${family.replace(/"/g, "\\\"")}"` : "";
+  }
+
+  function normalizeFamilyKey(value) {
+    return unquoteFontFamily(value).replace(/\s+/g, " ").toLowerCase();
+  }
+
+  async function familiesWithWebFacesForText(sampleText, signal) {
+    const families = [];
+    try {
+      const seen = new Set();
+      for (const face of document.fonts || []) {
+        if (signal?.aborted) throw makeCancelledError();
+        const family = unquoteFontFamily(face?.family || "");
+        const key = normalizeFamilyKey(family);
+        if (!family || seen.has(key)) continue;
+        seen.add(key);
+        families.push(family);
+        if (families.length >= 80) break;
+      }
+    } catch (error) {
+      if (isCancelledError(error)) throw error;
+    }
+
+    const matches = [];
+    for (let index = 0; index < families.length; index += 1) {
+      if (signal?.aborted) throw makeCancelledError();
+      const family = families[index];
+      try {
+        const loaded = await Promise.race([
+          document.fonts.load(`400 16px ${cssQuoteFamily(family)}`, sampleText),
+          sleep(220).then(() => [])
+        ]);
+        if (Array.isArray(loaded) && loaded.length) matches.push(family);
+      } catch {}
+      if (index % 8 === 0) await sleepWithAbort(0, signal);
+    }
+    return matches;
+  }
+
+  function familyAppearsInStack(family, stacks) {
+    const key = normalizeFamilyKey(family);
+    return stacks.some((stack) => splitFontFamilies(stack).some((item) => normalizeFamilyKey(item) === key));
+  }
+
+  function choosePreferredWebFamily(matches, stacks) {
+    const inStack = matches.find((family) => familyAppearsInStack(family, stacks));
+    return inStack || matches[0] || "";
+  }
+
+  function collectFontFaceRulesFromCssom(wantedKeys) {
+    const found = [];
+    const inaccessible = [];
+    const seenSheets = new Set();
+
+    const visitSheet = (sheet) => {
+      if (!sheet || seenSheets.has(sheet)) return;
+      seenSheets.add(sheet);
+      let rules;
+      try {
+        rules = sheet.cssRules;
+      } catch {
+        if (sheet.href) inaccessible.push(sheet.href);
+        return;
+      }
+      if (!rules) return;
+      for (const rule of rules) {
+        try {
+          if (typeof CSSFontFaceRule !== "undefined" && rule instanceof CSSFontFaceRule) {
+            const family = unquoteFontFamily(rule.style.getPropertyValue("font-family"));
+            if (wantedKeys.has(normalizeFamilyKey(family))) {
+              found.push({ cssText: rule.cssText, baseUrl: rule.parentStyleSheet?.href || sheet.href || location.href });
+            }
+          } else if (rule.styleSheet) {
+            visitSheet(rule.styleSheet);
+          } else if (rule.cssRules) {
+            for (const nested of rule.cssRules) {
+              if (typeof CSSFontFaceRule !== "undefined" && nested instanceof CSSFontFaceRule) {
+                const family = unquoteFontFamily(nested.style.getPropertyValue("font-family"));
+                if (wantedKeys.has(normalizeFamilyKey(family))) {
+                  found.push({ cssText: nested.cssText, baseUrl: nested.parentStyleSheet?.href || sheet.href || location.href });
+                }
+              }
+            }
+          }
+        } catch {}
+      }
+    };
+
+    for (const sheet of document.styleSheets || []) visitSheet(sheet);
+    return { found, inaccessible: [...new Set(inaccessible)].slice(0, 36) };
+  }
+
+  function extractFontFaceBlocks(cssText, wantedKeys, baseUrl) {
+    const blocks = [];
+    const text = String(cssText || "");
+    const re = /@font-face\s*\{[\s\S]*?\}/gi;
+    let match;
+    while ((match = re.exec(text)) && blocks.length < 40) {
+      const block = match[0];
+      const familyMatch = block.match(/font-family\s*:\s*([^;}]*)/i);
+      const family = unquoteFontFamily(familyMatch?.[1] || "");
+      if (wantedKeys.has(normalizeFamilyKey(family))) blocks.push({ cssText: block, baseUrl });
+    }
+    return blocks;
+  }
+
+  function absoluteCssUrls(cssText, baseUrl) {
+    return String(cssText || "").replace(/url\(\s*(['\"]?)([^'\")]+)\1\s*\)/gi, (whole, _quote, rawUrl) => {
+      const value = String(rawUrl || "").trim();
+      if (!value || /^(?:data:|blob:|chrome-extension:)/i.test(value)) return whole;
+      try { return `url("${new URL(value, baseUrl || location.href).href}")`; } catch { return whole; }
+    });
+  }
+
+  function fontUrlsFromCss(cssText) {
+    const urls = [];
+    String(cssText || "").replace(/url\(\s*(['\"]?)([^'\")]+)\1\s*\)/gi, (_whole, _quote, rawUrl) => {
+      const value = String(rawUrl || "").trim();
+      if (/^https?:\/\//i.test(value) && !urls.includes(value)) urls.push(value);
+      return _whole;
+    });
+    return urls;
+  }
+
+  async function fetchTextResource(url) {
+    try {
+      const response = await sendRuntimeMessage({ type: "CHATFOLIO_FETCH_TEXT_RESOURCE", url });
+      return response?.ok ? String(response.text || "") : "";
+    } catch {
+      return "";
+    }
+  }
+
+  async function fetchDataUrlResource(url) {
+    try {
+      const response = await sendRuntimeMessage({ type: "CHATFOLIO_FETCH_DATA_RESOURCE", url });
+      return response?.ok ? String(response.dataUrl || "") : "";
+    } catch {
+      return "";
+    }
+  }
+
+  async function captureProviderFontFaces(wantedFamilies, signal) {
+    const wantedKeys = new Set(wantedFamilies.map(normalizeFamilyKey).filter(Boolean));
+    if (!wantedKeys.size) return { css: "", rules: 0, embeddedResources: 0 };
+
+    const { found, inaccessible } = collectFontFaceRulesFromCssom(wantedKeys);
+    const rules = [...found];
+
+    // Some provider stylesheets are cross-origin and CSSOM intentionally hides
+    // cssRules. Fetch only those provider stylesheets through the extension service
+    // worker, then extract the matching @font-face declarations.
+    for (const href of inaccessible) {
+      if (signal?.aborted) throw makeCancelledError();
+      const cssText = await fetchTextResource(href);
+      if (!cssText) continue;
+      rules.push(...extractFontFaceBlocks(cssText, wantedKeys, href));
+      if (rules.length >= 24) break;
+    }
+
+    const unique = [];
+    const seen = new Set();
+    for (const item of rules) {
+      const absolute = absoluteCssUrls(item.cssText, item.baseUrl);
+      const key = absolute.replace(/\s+/g, " ").trim();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      unique.push(absolute);
+      if (unique.length >= 20) break;
+    }
+
+    const resourceCache = new Map();
+    let embeddedResources = 0;
+    let embeddedBytesEstimate = 0;
+    const embeddedRules = [];
+    for (const ruleText of unique) {
+      if (signal?.aborted) throw makeCancelledError();
+      let rewritten = ruleText;
+      for (const url of fontUrlsFromCss(ruleText)) {
+        if (signal?.aborted) throw makeCancelledError();
+        let dataUrl = resourceCache.get(url);
+        if (dataUrl === undefined) {
+          dataUrl = await fetchDataUrlResource(url);
+          resourceCache.set(url, dataUrl || "");
+        }
+        // Keep the whole font snapshot bounded so a provider with many subsets
+        // cannot turn a PDF export into a huge extension message.
+        if (dataUrl && embeddedBytesEstimate + dataUrl.length <= 6 * 1024 * 1024) {
+          rewritten = rewritten.split(url).join(dataUrl);
+          embeddedBytesEstimate += dataUrl.length;
+          embeddedResources += 1;
+        }
+      }
+      embeddedRules.push(rewritten);
+    }
+
+    return {
+      css: embeddedRules.join("\n"),
+      rules: embeddedRules.length,
+      embeddedResources
+    };
+  }
+
+  async function detectSourceTypography(signal) {
+    const roots = [];
+    try {
+      const authored = dedupeNestedMessages(getMessageNodes()).slice(-16);
+      roots.push(...authored);
+    } catch {}
+    if (!roots.length) {
+      const main = document.querySelector("main");
+      if (main) roots.push(main);
+      if (document.body) roots.push(document.body);
+    }
+
+    const candidates = [];
+    const seen = new Set();
+    for (const root of roots) {
+      if (!root || seen.has(root)) continue;
+      seen.add(root);
+      if (root instanceof HTMLElement) candidates.push(root);
+      const descendants = root.querySelectorAll?.("p, li, blockquote, div, span") || [];
+      for (const node of descendants) {
+        if (candidates.length >= 900) break;
+        if (!seen.has(node)) {
+          seen.add(node);
+          candidates.push(node);
+        }
+      }
+      if (candidates.length >= 900) break;
+    }
+
+    const arabicRegex = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/;
+    const latinRegex = /[A-Za-z]/;
+
+    const pick = (direction) => {
+      let best = null;
+      let bestScore = -Infinity;
+      for (const node of candidates) {
+        if (!isVisibleTypographyNode(node)) continue;
+        const text = normalizeText(node.innerText || node.textContent || "");
+        if (text.length < 8 || text.length > 1400) continue;
+        const hasTarget = direction === "rtl" ? arabicRegex.test(text) : latinRegex.test(text);
+        if (!hasTarget) continue;
+        const childCount = node.children?.length || 0;
+        const direct = directTextLength(node);
+        const score = Math.min(text.length, 360) + Math.min(direct, 180) * 1.6 - childCount * 2.4;
+        if (score > bestScore) {
+          best = node;
+          bestScore = score;
+        }
+      }
+      return best;
+    };
+
+    const read = (node) => {
+      const target = node || document.body || document.documentElement;
+      if (!target) return null;
+      const style = getComputedStyle(target);
+      return {
+        fontFamily: sanitizeFontFamily(style.fontFamily),
+        fontSize: String(style.fontSize || ""),
+        fontWeight: String(style.fontWeight || ""),
+        lineHeight: String(style.lineHeight || ""),
+        letterSpacing: String(style.letterSpacing || "")
+      };
+    };
+
+    const base = read(document.body || document.documentElement);
+    const rtl = read(pick("rtl"));
+    const ltr = read(pick("ltr"));
+    const stacks = [base?.fontFamily || "", rtl?.fontFamily || "", ltr?.fontFamily || ""];
+
+    // v1.5 intentionally does not copy font files into the extension print page.
+    // The primary print path now stays inside the live provider document, where
+    // fonts loaded by the provider or by another extension are already present.
+    // Keeping the exact computed stacks is both more faithful and more robust.
+    if (signal?.aborted) throw makeCancelledError();
+
+    return { base, rtl, ltr, fontFaceCss: "", fontFaceRules: 0, embeddedFontResources: 0 };
+  }
+
+  function mergeFontStacks(primary, fallback) {
+    const clean = sanitizeFontFamily(primary);
+    if (!clean) return fallback;
+    const normalizedPrimary = clean.toLowerCase();
+    if (normalizedPrimary.includes("system-ui") && normalizedPrimary.includes("sans-serif")) return clean;
+    return `${clean}, ${fallback}`;
+  }
+
+  function buildPrintableDocument(messages, title, options, totalImageCount, platform, sourceTypography = null) {
     const exportedAt = new Intl.DateTimeFormat(undefined, {
       dateStyle: "medium",
       timeStyle: "short"
@@ -2030,6 +4458,13 @@
     const isRtlDocument = documentDir === "rtl";
     const layoutMode = options.layoutMode === "compact" ? "compact" : "comfortable";
     const showMessageNumbers = options.showMessageNumbers !== false;
+    const systemUiStack = 'ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif';
+    const sourceBaseFont = sourceTypography?.base?.fontFamily || "";
+    const sourceRtlFont = sourceTypography?.rtl?.fontFamily || sourceBaseFont;
+    const sourceLtrFont = sourceTypography?.ltr?.fontFamily || sourceBaseFont;
+    const documentFontStack = mergeFontStacks(isRtlDocument ? sourceRtlFont : sourceLtrFont, systemUiStack);
+    const ltrFontStack = mergeFontStacks(sourceLtrFont, systemUiStack);
+    const rtlFontStack = mergeFontStacks(sourceRtlFont, systemUiStack);
     const userCount = messages.filter((message) => message.role === "user").length;
     const assistantCount = messages.filter((message) => message.role === "assistant").length;
     const exchanges = groupMessagesIntoExchanges(messages);
@@ -2114,6 +4549,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${escapeHtml(title)}</title>
   <style>
+    ${sourceTypography?.fontFaceCss || ""}
+
     @page {
       size: A4;
       margin: 15mm 14mm 16mm;
@@ -2130,12 +4567,16 @@
       --code-bg: #f6f7f8;
       --accent: #0f8f70;
       --accent-soft: #eaf7f2;
+      --font-source: ${documentFontStack};
+      --font-latin: ${ltrFontStack};
+      --font-rtl-source: ${rtlFontStack};
+      --font-arabic-fallback: "Noto Sans Arabic", "Noto Naskh Arabic", Tahoma, Arial, sans-serif;
     }
 
     html {
       background: #fff;
       color: var(--ink);
-      font-family: Inter, "Segoe UI", Roboto, Arial, "Noto Sans", sans-serif;
+      font-family: var(--font-source), var(--font-arabic-fallback);
       font-size: ${layoutMode === "compact" ? "10.1pt" : "10.9pt"};
       line-height: ${layoutMode === "compact" ? "1.52" : "1.62"};
       text-rendering: optimizeLegibility;
@@ -2147,7 +4588,10 @@
     }
 
     html[data-script="arabic"] {
-      font-family: "Noto Sans Arabic", "Noto Naskh Arabic", Vazirmatn, "Segoe UI", Tahoma, Arial, sans-serif;
+      /* Match the provider page's own CSS font stack first. Let Chrome choose the
+         same glyph-level fallback it uses in the live chat instead of forcing a
+         different Arabic font for the entire RTL block. */
+      font-family: var(--font-source), var(--font-arabic-fallback);
     }
 
     html[data-script="hebrew"] {
@@ -2318,11 +4762,23 @@
     .message-body [dir="rtl"] {
       text-align: right !important;
       unicode-bidi: plaintext;
+      font-family: var(--font-rtl-source), var(--font-arabic-fallback);
     }
 
     .message-body [dir="ltr"] {
       text-align: left !important;
       unicode-bidi: plaintext;
+      font-family: var(--font-latin);
+    }
+
+    /* Keep UI labels on the same live-page font stack captured from the provider.
+       This mirrors the browser's own glyph fallback for Persian/Arabic instead of
+       forcing a separate Arabic family across the whole RTL block. */
+    html[dir="rtl"] .document-kicker,
+    html[dir="rtl"] .document-stats,
+    html[dir="rtl"] .role-badge,
+    html[dir="rtl"] .message-number {
+      font-family: var(--font-rtl-source), var(--font-arabic-fallback);
     }
 
     .message-body p,
@@ -2447,6 +4903,16 @@
       max-width: 100% !important;
       height: auto !important;
       object-fit: contain;
+    }
+
+    .export-api-image {
+      margin: 10px 0 12px;
+      break-inside: avoid;
+      page-break-inside: avoid;
+    }
+
+    .export-api-image img {
+      display: block;
     }
 
     img.export-user-media,
@@ -2668,7 +5134,18 @@
     let uiLocale = "en";
     let script = "latin";
 
-    if (arabic >= Math.max(40, latin * 0.18)) {
+    // Direction and script must not disagree merely because a Persian/Arabic chat
+    // contains lots of English identifiers, URLs, code, or pasted technical text.
+    // If the document is clearly RTL, choose its RTL script first.
+    if (dir === "rtl" && arabic >= 20 && arabic >= hebrew * 0.75) {
+      script = "arabic";
+      if (hasUrduSpecific) lang = "ur";
+      else if (hasPersianSpecific) { lang = "fa"; uiLocale = "fa"; }
+      else { lang = "ar"; uiLocale = "ar"; }
+    } else if (dir === "rtl" && hebrew >= 20) {
+      script = "hebrew";
+      lang = "he";
+    } else if (arabic >= Math.max(40, latin * 0.18)) {
       script = "arabic";
       if (hasUrduSpecific) lang = "ur";
       else if (hasPersianSpecific) { lang = "fa"; uiLocale = "fa"; }
@@ -2703,6 +5180,320 @@
     }
 
     return { lang, dir, uiLocale, script };
+  }
+
+  function collectDomDiagnostics() {
+    try {
+      const main = document.querySelector('main');
+      const counts = {
+        role: document.querySelectorAll('[data-message-author-role], [data-role="user"], [data-role="assistant"], [data-message-author="user"], [data-message-author="assistant"]').length,
+        turns: document.querySelectorAll('section[data-turn], article[data-turn], [data-testid*="conversation-turn"]').length,
+        turnKeys: document.querySelectorAll('[data-turn-key]').length,
+        userBubbles: document.querySelectorAll('[data-user-message-bubble]').length,
+        assistantRoles: document.querySelectorAll('[data-conversation-role="assistant"], [data-chatgpt-agent-turn-start]').length,
+        claude: document.querySelectorAll('[data-test-render-count], [data-testid="user-message"], .font-claude-response').length,
+        gemini: document.querySelectorAll('user-query, model-response, .conversation-container').length,
+        mainChildren: main?.children?.length || 0
+      };
+      return `DOM diagnostics: role=${counts.role}, turns=${counts.turns}, turnKeys=${counts.turnKeys}, userBubbles=${counts.userBubbles}, assistantRoles=${counts.assistantRoles}, claude=${counts.claude}, gemini=${counts.gemini}, main=${counts.mainChildren}.`;
+    } catch {
+      return 'DOM diagnostics unavailable.';
+    }
+  }
+
+  function makePrintJobId() {
+    try {
+      if (crypto?.randomUUID) return crypto.randomUUID();
+    } catch {}
+    return `chatfolio-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+
+  function sendRuntimeMessage(message) {
+    return new Promise((resolve, reject) => {
+      try {
+        chrome.runtime.sendMessage(message, (response) => {
+          const error = chrome.runtime.lastError;
+          if (error) reject(new Error(error.message || String(error)));
+          else resolve(response);
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  function extractPrintableParts(html) {
+    const source = String(html || "");
+    const styleMatch = source.match(/<style>([\s\S]*?)<\/style>/i);
+    const bodyMatch = source.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+    const htmlMatch = source.match(/<html\b([^>]*)>/i);
+    if (!styleMatch || !bodyMatch) throw new Error("The printable document could not be prepared for live-page printing.");
+
+    const attrs = htmlMatch?.[1] || "";
+    const readAttr = (name, fallback = "") => {
+      const match = attrs.match(new RegExp(`${name}=["']([^"']*)["']`, "i"));
+      return match?.[1] || fallback;
+    };
+
+    return {
+      css: styleMatch[1],
+      bodyHtml: bodyMatch[1],
+      lang: readAttr("lang", document.documentElement.lang || "en"),
+      dir: readAttr("dir", document.documentElement.dir || "ltr"),
+      script: readAttr("data-script", "latin")
+    };
+  }
+
+  function scopePrintableCssForShadow(css) {
+    let scoped = String(css || "");
+    // The generated stylesheet was originally authored for a standalone HTML
+    // document. In live-page mode it is mounted in a ShadowRoot, so remap only
+    // the document-level selectors while leaving all message selectors intact.
+    scoped = scoped.replace(/:root\s*\{/g, ":host {");
+    scoped = scoped.replace(/html\[dir="rtl"\]/g, ".chatfolio-live-document[dir=\"rtl\"]");
+    scoped = scoped.replace(/html\[data-script="arabic"\]/g, ".chatfolio-live-document[data-script=\"arabic\"]");
+    scoped = scoped.replace(/html\[data-script="hebrew"\]/g, ".chatfolio-live-document[data-script=\"hebrew\"]");
+    scoped = scoped.replace(/html\[data-script="cjk"\]/g, ".chatfolio-live-document[data-script=\"cjk\"]");
+    scoped = scoped.replace(/html\[data-script="devanagari"\]/g, ".chatfolio-live-document[data-script=\"devanagari\"]");
+    scoped = scoped.replace(/html\[data-script="thai"\]/g, ".chatfolio-live-document[data-script=\"thai\"]");
+    scoped = scoped.replace(/html\s*,\s*body\s*,\s*main/g, ".chatfolio-live-document, .chatfolio-live-body, main");
+    scoped = scoped.replace(/(^|\n)(\s*)html\s*\{/g, "$1$2.chatfolio-live-document {");
+    scoped = scoped.replace(/(^|\n)(\s*)body\s*\{/g, "$1$2.chatfolio-live-body {");
+    return scoped;
+  }
+
+  let livePrintTrustedPolicy = null;
+  function appendGeneratedHtml(target, html) {
+    // The HTML passed here is generated and sanitized by ChatFolio itself. Use a
+    // contextual fragment first because it does not require document.write and
+    // works in provider pages that enforce strict Trusted Types policies.
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(target);
+      const fragment = range.createContextualFragment(String(html || ""));
+      target.replaceChildren(fragment);
+      return;
+    } catch (rangeError) {
+      try {
+        const tt = globalThis.trustedTypes;
+        if (tt && !livePrintTrustedPolicy) {
+          livePrintTrustedPolicy = tt.createPolicy("chatfolio-live-print", { createHTML: (value) => value });
+        }
+        target.innerHTML = livePrintTrustedPolicy ? livePrintTrustedPolicy.createHTML(String(html || "")) : String(html || "");
+        return;
+      } catch (innerError) {
+        throw new Error(`Could not mount the printable conversation in the live page (${innerError?.message || rangeError?.message || "HTML parser blocked"}).`);
+      }
+    }
+  }
+
+  async function waitForLivePrintAssets(shadowRoot, sourceTypography, signal) {
+    const images = [...shadowRoot.querySelectorAll("img")];
+    if (images.length) {
+      await Promise.race([
+        Promise.all(images.map((img) => {
+          if (img.complete) return Promise.resolve();
+          return new Promise((resolve) => {
+            img.addEventListener("load", resolve, { once: true });
+            img.addEventListener("error", resolve, { once: true });
+          });
+        })),
+        sleepWithAbort(5000, signal)
+      ]).catch(() => {});
+    }
+
+    // Crucial for interoperability with font/RTL extensions: the Persian font
+    // may be a FontFace loaded by another extension and therefore impossible for
+    // our extension-origin print page to fetch. In the provider document the
+    // already-loaded FontFaceSet is shared with this ShadowRoot, so requesting
+    // the exact computed family makes Chrome reuse that same face.
+    const families = [
+      sourceTypography?.rtl?.fontFamily,
+      sourceTypography?.base?.fontFamily,
+      sourceTypography?.ltr?.fontFamily
+    ].filter(Boolean);
+    const sample = "سلام فارسی پژوهش ChatGPT conversation";
+    for (const family of families) {
+      if (signal?.aborted) throw makeCancelledError();
+      try {
+        await Promise.race([
+          document.fonts.load(`400 16px ${family}`, sample),
+          sleepWithAbort(1200, signal)
+        ]);
+      } catch {}
+    }
+    if (document.fonts?.ready) {
+      await Promise.race([document.fonts.ready, sleepWithAbort(1800, signal)]).catch(() => {});
+    }
+  }
+
+  async function deliverPrintableDocumentInLivePage(html, title, session) {
+    const parts = extractPrintableParts(html);
+    const hostId = `chatfolio-live-print-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const host = document.createElement("div");
+    host.id = hostId;
+    host.setAttribute("data-chatfolio-live-print", "true");
+    host.setAttribute("lang", parts.lang || document.documentElement.lang || "en");
+    host.setAttribute("dir", parts.dir || document.documentElement.dir || "ltr");
+    host.setAttribute("data-script", parts.script || "latin");
+    host.style.cssText = [
+      "position:fixed",
+      "left:-300vw",
+      "top:0",
+      "width:210mm",
+      "visibility:hidden",
+      "pointer-events:none",
+      "z-index:-2147483648",
+      "background:#fff"
+    ].join(";");
+
+    const pageStyle = document.createElement("style");
+    pageStyle.setAttribute("data-chatfolio-live-print-style", "true");
+    pageStyle.textContent = `
+      @page { size: A4; margin: 15mm 14mm 16mm; }
+      @media print {
+        html, body {
+          margin: 0 !important;
+          padding: 0 !important;
+          background: #fff !important;
+          min-height: 0 !important;
+          height: auto !important;
+          overflow: visible !important;
+        }
+        body > *:not(#${hostId}) { display: none !important; }
+        body::before, body::after { display: none !important; content: none !important; }
+        #${hostId} {
+          display: block !important;
+          position: static !important;
+          left: auto !important;
+          top: auto !important;
+          width: auto !important;
+          min-width: 0 !important;
+          max-width: none !important;
+          height: auto !important;
+          min-height: 0 !important;
+          visibility: visible !important;
+          pointer-events: auto !important;
+          z-index: auto !important;
+          overflow: visible !important;
+          transform: none !important;
+          opacity: 1 !important;
+          background: #fff !important;
+        }
+      }
+    `;
+
+    let cleaned = false;
+    const originalTitle = document.title;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      try { window.removeEventListener("afterprint", cleanup); } catch {}
+      try { host.remove(); } catch {}
+      try { pageStyle.remove(); } catch {}
+      try { document.title = originalTitle; } catch {}
+    };
+
+    try {
+      // Do not use a ShadowRoot here. Chromium can omit a shadow tree from the
+      // print layout when the host is swapped in only for @media print, which
+      // produced a one-page blank PDF on ChatGPT. Keeping the printable tree in
+      // the provider document's light DOM preserves the provider FontFaceSet
+      // (including fonts loaded by RTL/font extensions) and is reliably printed.
+      const style = document.createElement("style");
+      style.setAttribute("data-chatfolio-print-document-style", "true");
+      style.textContent = scopePrintableCssForShadow(parts.css);
+      host.appendChild(style);
+
+      const docRoot = document.createElement("div");
+      docRoot.className = "chatfolio-live-document";
+      docRoot.lang = parts.lang;
+      docRoot.dir = parts.dir;
+      docRoot.dataset.script = parts.script;
+      const body = document.createElement("div");
+      body.className = "chatfolio-live-body";
+      appendGeneratedHtml(body, parts.bodyHtml);
+      docRoot.appendChild(body);
+      host.appendChild(docRoot);
+
+      document.documentElement.appendChild(pageStyle);
+      document.body.appendChild(host);
+      document.title = title || originalTitle || `${PLATFORM.name} Conversation`;
+
+      // Force layout before entering print mode. This also verifies that the
+      // generated conversation is actually mounted and non-empty.
+      const mountedText = String(docRoot.innerText || "").trim();
+      const mountedMedia = docRoot.querySelector("img, svg, canvas, video, audio");
+      if (!mountedText && !mountedMedia) {
+        throw new Error("The printable conversation mounted without any visible content.");
+      }
+      void host.offsetHeight;
+
+      await waitForLivePrintAssets(host, session.sourceTypography || null, session.controller.signal);
+      throwIfCancelled(session);
+
+      window.addEventListener("afterprint", cleanup, { once: true });
+      window.focus();
+      window.print();
+      // Chromium normally blocks here until the dialog closes. Keep a generous
+      // fallback cleanup for browsers where afterprint is delayed or omitted.
+      setTimeout(cleanup, 2500);
+      return true;
+    } catch (error) {
+      cleanup();
+      throw error;
+    }
+  }
+
+  async function deliverPrintableDocumentViaExtensionPage(html, title, session) {
+    const jobId = makePrintJobId();
+    const memory = clampNumber(navigator.deviceMemory || 4, 1, 32);
+    const chunkSize = memory >= 8 ? 512 * 1024 : (memory >= 4 ? 384 * 1024 : 256 * 1024);
+    const totalChunks = Math.max(1, Math.ceil(html.length / chunkSize));
+    let began = false;
+
+    try {
+      const begin = await sendRuntimeMessage({
+        type: 'CHATFOLIO_PRINT_BEGIN',
+        jobId,
+        title: String(title || `${PLATFORM.name} Conversation`),
+        platform: PLATFORM.id,
+        platformName: PLATFORM.name,
+        totalChunks,
+        sourceUrl: location.href
+      });
+      if (!begin?.ok) throw new Error(begin?.error || 'Could not open the ChatFolio print view.');
+      began = true;
+
+      const indices = Array.from({ length: totalChunks }, (_value, index) => index);
+      await mapWithConcurrency(indices, async (index) => {
+        throwIfCancelled(session);
+        const chunk = html.slice(index * chunkSize, (index + 1) * chunkSize);
+        const response = await sendRuntimeMessage({ type: 'CHATFOLIO_PRINT_CHUNK', jobId, index, data: chunk });
+        if (!response?.ok) throw new Error(response?.error || `Could not transfer print data (${index + 1}/${totalChunks}).`);
+        return true;
+      }, {
+        concurrency: adaptiveTransferConcurrency(),
+        signal: session.controller.signal
+      });
+
+      throwIfCancelled(session);
+      const end = await sendRuntimeMessage({ type: 'CHATFOLIO_PRINT_END', jobId });
+      if (!end?.ok) throw new Error(end?.error || 'Could not finalize the ChatFolio print view.');
+    } catch (error) {
+      if (began) {
+        try { await sendRuntimeMessage({ type: 'CHATFOLIO_PRINT_ABORT', jobId }); } catch {}
+      }
+      throw error;
+    }
+  }
+
+  async function deliverPrintableDocument(html, title, session) {
+    // Stable print path: always render in ChatFolio's own extension page.
+    // Live-page printing was removed because provider pages can reject or hide
+    // the mounted print document, which created noisy extension errors even when
+    // the fallback PDF was generated successfully.
+    await deliverPrintableDocumentViaExtensionPage(html, title, session);
   }
 
   async function waitForPrintDocument(printWindow) {

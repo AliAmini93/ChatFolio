@@ -24,3 +24,5 @@
 - [ ] Add privacy policy URL from public GitHub repository
 - [ ] Complete Privacy tab permissions/data-use disclosures
 - [ ] Submit for review
+
+- [ ] Test assisted Visual backup manually: go to the beginning, Start capture, scroll through a long chat, verify many distinct captured views, then Finish & create PDF.

@@ -15,7 +15,7 @@
       <div class="brand-copy">
         <div class="brand-line">
           <h1>ChatFolio</h1>
-          <span class="version-pill">v1.0.0</span>
+          <span id="versionPill" class="version-pill">v1.5.0</span>
         </div>
         <p>Export AI conversations to PDF</p>
       </div>
@@ -106,24 +106,23 @@
         <span class="button-icon" aria-hidden="true">↗</span>
         <span>Export full chat</span>
       </button>
+      <button id="visualBtn" class="visual-button" type="button" title="Assisted layout-independent visual archive for emergency backup">
+        <span aria-hidden="true">▣</span>
+        <span>Visual backup</span>
+      </button>
       <button id="stopBtn" class="stop-button" type="button" hidden>
         <span aria-hidden="true">■</span>
-        <span>Stop scan</span>
+        <span>Stop export</span>
       </button>
     </div>
 
     <section id="progressWrap" class="progress-card" hidden>
       <div class="progress-head">
         <span class="live-dot" aria-hidden="true"></span>
-        <strong>Conversation scan</strong>
-        <span id="progressPercent">0%</span>
+        <strong>Conversation export</strong>
       </div>
       <div class="progress-track" aria-hidden="true">
         <div id="progressBar" class="progress-bar"></div>
-      </div>
-      <div class="stats">
-        <span id="messageCount">0 messages</span>
-        <span id="imageCount">0 media</span>
       </div>
     </section>
 
