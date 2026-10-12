@@ -201,6 +201,13 @@ async function ensureContentScript(tabId, platform) {
   // extension is updated. Never stack two message listeners on the same page.
   // Reload once so the new worker starts against the current provider DOM.
   if (pong?.ok && pong?.version && pong.version !== EXTENSION_VERSION) {
+    // Temporary ChatGPT pages can disappear when reloaded. Never refresh them
+    // automatically during an extension update, even to replace an old worker.
+    const [current] = await chrome.tabs.query({active:true,currentWindow:true});
+    const temporary = platform.id === 'chatgpt' && /[?&]temporary-chat=true(?:&|$)/.test(current?.url || '');
+    if (temporary) {
+      throw new Error('An older ChatFolio script is active in this Temporary Chat. ChatFolio will NOT reload the tab or risk losing it. Disable the older extension, then load this version as a separate unpacked extension and retry from the still-open tab.');
+    }
     statusEl.textContent = `ChatFolio was updated. Refreshing the ${platform.name} tab once…`;
     await chrome.tabs.reload(tabId);
     await waitForTabComplete(tabId);

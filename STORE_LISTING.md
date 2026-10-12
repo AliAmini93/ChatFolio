@@ -32,6 +32,6 @@ English (primary listing)
 - Provider-hosted images may be fetched when image embedding is enabled.
 
 
-Resilience
-- Automatic visual archive fallback when provider layout/data changes prevent normal extraction
-- The fallback scrolls and captures the conversation without relying on message selectors
+## Resilience
+- Assisted Visual Backup is available as a separately chosen mode when normal extraction cannot complete.
+- The user scrolls the conversation manually while ChatFolio captures visible pages.

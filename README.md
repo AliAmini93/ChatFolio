@@ -1,109 +1,86 @@
 # ChatFolio
 
-Current release: **1.8.0**
+Current pre-release candidate: **1.8.8**. Stable public release: **1.8.0**.
 
-ChatFolio is a Chrome extension that exports conversations from ChatGPT, Claude, and Gemini to PDF.
+ChatFolio is a Chrome extension for exporting ChatGPT, Claude, and Gemini conversations to printable, searchable PDF documents when semantic extraction is available. When it isn't, the extension offers an assisted screenshot-based Visual Backup.
 
-## Supported platforms
+## Installation
 
-- ChatGPT
+1. Extract `chatfolio-1.8.8-chrome.zip`.
+2. Open `chrome://extensions/` in Chrome and enable **Developer mode**.
+3. Choose **Load unpacked**, and select the extracted `chatfolio-1.8.8` folder containing `manifest.json`.
+4. Open a supported conversation and choose **Export full chat** from the ChatFolio popup.
+5. In the Chrome print dialog, choose **Save as PDF**. Recent Chromium versions suppress their default page headers/footers through ChatFolio print CSS. If your browser still shows them, disable **Headers and footers**.
+
+**Temporary Chat safety:** Do not refresh a still-open Temporary Chat tab just to update ChatFolio. Disable the older extension and load the new unpacked directory. ChatFolio 1.8.8 will not automatically reload Temporary Chat pages when an old content script is detected.
+
+## Supported services
+
+- ChatGPT (including shared-chat routes where full data is accessible)
 - Claude
 - Gemini
 
-## Features
+## Export paths
 
-- Three-layer resilience: provider data -> semantic DOM scanner -> assisted visual backup
-- Adaptive bounded concurrency for faster ChatGPT text/media extraction and print transfer on faster machines
-- Quota-safe Visual backup paced to Chrome's screenshot API limit, with retry backoff instead of failing on burst capture
-- Assisted visual backup when a provider redesign prevents message detection/extraction
-- **Visual backup** opens an on-page capture panel so the user can scroll the real conversation while ChatFolio archives the visible views
-- Visual backup does not programmatically crawl provider scroll containers; it follows real user scrolling and captures distinct visible views, avoiding virtualized-history failures
-- ChatGPT data-first active-branch extraction with DOM fallback
-- Resilient full-conversation scanning across current and fallback Claude/Gemini DOM layouts
-- Full-conversation scanning for long chats
-- Stop and stall-recovery controls
-- Extension-origin print view to avoid provider popup/CSP differences
-- User/assistant separation
-- Multilingual RTL/LTR layout
-- Tables, code blocks, links, images, and detected attachments
-- Comfortable and Compact reading density
-- Light, Graphite, and Dark extension themes
-- Local preference storage
+- **ChatGPT data-first:** first attempts to read the selected conversation branch using ChatGPT's existing authenticated, first-party interface. This route can be unavailable for temporary conversations.
+- **Semantic DOM fallback:** traverses the browser's chat DOM, resolves authored messages/media, and preserves text selectability.
+- **Assisted Visual Backup:** a separate user-selected mode for cases in which semantic extraction is unavailable. It captures visible screens as an image-based archive while you scroll manually. A failed normal export now shows an error instead of opening this mode unexpectedly.
 
-## Install from source
+## Fixes in 1.8.8
 
-1. Download or clone this repository.
-2. Open `chrome://extensions/`.
-3. Enable **Developer mode**.
-4. Click **Load unpacked**.
-5. Select the extension folder that contains `manifest.json`.
+- Author-defined empty page-margin boxes hide the browser-added date, long extension URL and default page counters in current Chrome, even when Print > Headers and footers is enabled. This is CSS based and not guaranteed on older/non-Chromium browsers.
+- Short tables are kept together when they fit on one page; long tables retain a repeatable THEAD, including when a provider placed the first TH row in TBODY.
+- Printed citation/source cards become small, wrapping source chips with original links and icons preserved.
+- Strengthened page-break hints between role badges and the opening content of each answer.
+- No changes to the scanning, deduplication, stop, or visual backup engines.
 
-## Usage
+## Fixes carried forward from 1.8.6
 
-1. Open a conversation in ChatGPT, Claude, or Gemini.
-2. Open ChatFolio from the Chrome toolbar.
-3. Choose the reading density and options you want.
-4. Click **Export full chat**.
-5. In Chrome's print dialog, choose **Save to PDF**.
+- Normalize provider-only CSS classes/data attributes on the print clone while retaining ChatFolio, KaTeX, and code syntax classes. Prevents source card utility CSS from introducing massive print whitespace.
+- Strip grid, flex, aspect-ratio, and margin/padding inline layout hints that do not belong in a paginated document.
+- Allow long figures/cards to split between pages while keeping their image media unbroken.
+- Slightly reduce exchange spacing and cap non-screenshot response images at 108mm height, without sacrificing body readability.
+- Keep the scanning and Stop code unchanged; validate text, images, links, tables, and math using browser fixtures.
 
-For a cleaner PDF, disable **Headers and footers** in Chrome's print dialog.
+## Fixes carried forward from 1.8.5
 
-## Privacy
+- Recognizes signed-negative scroll offsets in reversed flex scrollports (0 at bottom, negative at top), then scans in a normalized forward coordinate.
+- Probes both positive and negative directions before rejecting a candidate scrollport.
+- If scanning is still blocked, reports probe offsets and message movement without including chat text.
+- Stops automatic tab refresh on update for Temporary Chat pages.
+- The reverse-scroll fix has been validated on a real ChatGPT Temporary Chat (16 exported turns), but provider interfaces may still change.
 
-ChatFolio processes conversation content in the browser to create the printable document. It does not send conversation content to a ChatFolio-controlled server. For complete ChatGPT exports it may read the current conversation through ChatGPT's own authenticated metadata endpoint; the temporary access token is held only in memory and is not stored or exported. When image embedding is enabled, the extension may fetch image resources from the AI provider domains that already host those resources. If semantic extraction fails, the visual fallback captures the active conversation tab locally through Chrome's capture API and sends those captures only to ChatFolio's local print page; they are not uploaded to a ChatFolio server.
+## Fixes carried forward from 1.8.4
 
-See [PRIVACY.md](PRIVACY.md).
+- Verifies the actual conversation scroll container using visible message movement, not scrollTop changes alone.
+- Detects new virtualized message content and tolerates temporary scroll-anchor jumps.
+- Re-detects the scroller after a stall and limits recovery to three attempts.
+- No longer mistakes the final *mounted* message for the end of a long ChatGPT conversation.
+- Stabilizes message fingerprints when adjacent virtualized turns mount and unmount, preventing duplicate exports.
+- Does not automatically launch Visual Backup after a failed ordinary export; the user may choose it explicitly.
+
+- Avoids capturing only the `ChatGPT said:` accessibility/role caption when the actual response appears in adjacent elements of a grouped ChatGPT turn.
+- Separates the user's question from the assistant's group-wide response capture.
+- Checks for label-only/empty assistant captures and refuses to silently produce an incomplete semantic PDF.
+- Keeps the live rendered image width where available, with separate compact image caps for generated/product pictures and larger caps for screenshots.
+- Recognizes ChatGPT `temporary-chat=true` routes as routes where ordinary conversation metadata may be unavailable.
+- Adds start/end scan guards against unverified partial traversal.
 
 ## Known limitations
 
-- ChatGPT, Claude, and Gemini can change their internal data structures and page behavior without notice. Semantic export can still require maintenance after major provider changes.
-- If semantic export fails, ChatFolio opens the assisted visual-backup panel. The user scrolls the conversation normally, then chooses Finish & create PDF. The resulting archive is image-based rather than selectable/searchable and may include some provider UI.
-- Extremely long visual-backup archives can create large PDF files because each captured view is stored as an image. Chrome limits visible-tab capture frequency, so Visual backup is intentionally slower than semantic export even on very fast hardware.
-- Some historical attachments may no longer be accessible from the provider and therefore cannot always be reconstructed in semantic mode.
-- Browser-added print headers/footers are controlled by Chrome, not ChatFolio.
+- ChatGPT, Claude and Gemini frequently change DOM and API response structures. There is no universal guarantee of full-chat extraction if a provider exposes neither complete conversation metadata nor its full history to the browser.
+- Temporary chats may be readable only through DOM scanning or Visual Backup.
+- Some inaccessible old images/attachments cannot be recovered after their provider links expire.
+- Visual Backup is image-based and may create large PDFs. Use the manual capture process as instructed by the panel.
+- Chrome controls its own print-dialog headers and footers.
+- **1.8.1 source was not part of the provided archive.** This build applies and tests the repairs against the supplied **1.8.0** code; features added only in a separate 1.8.1 build are not independently verified here.
 
-## License
+## Local tests
 
-MIT. See [LICENSE](LICENSE).
+If Python and Playwright are installed, run `python tests/test_negative_scroll_185.py`, `python tests/test_scroller_184.py`, `python tests/test_grouped_renderer.py`, and `python tests/test_layout_186.py`. Tests use synthetic DOM examples; they do not substitute for testing on the live ChatGPT conversation that produced a truncated PDF.
 
-## Trademark notice
+## Privacy and license
 
-ChatGPT, Claude, Gemini, OpenAI, Anthropic, and Google are trademarks of their respective owners. ChatFolio is not affiliated with or endorsed by those companies.
+ChatFolio has no backend storing your chats. Its browser-side extraction may request first-party provider metadata, media and font resources as needed. See [PRIVACY.md](PRIVACY.md).
 
-
-## Version 1.3.0
-
-- Mirrors the live provider page font stack for normal prose, including Persian/Arabic glyph fallback, instead of forcing a separate Arabic font.
-- Restores meaningful ChatGPT progress reporting in metadata mode: connection, download, message parsing, rendering, and print-view phases.
-- Keeps ChatGPT metadata-first extraction with DOM fallback, reducing sensitivity to UI/layout changes.
-- Claude and Gemini retain layered provider-specific DOM adapters plus diagnostics; provider redesigns can still require adapter updates.
-
-
-
-## Version 1.5.6
-
-- Public ChatGPT share links are decoded from the first-party React Router hydration/turbo-stream embedded in the share page.
-- The legacy `/backend-api/share/<id>` JSON endpoint is now only a compatibility fallback because public links may return HTTP 401/403 there.
-- Shared-chat export still fails closed instead of silently generating a partial PDF if neither full-data route is available.
-
-## Version 1.5.4
-
-- Removed experimental live-page printing and restored the stable extension-owned print page as the only print path.
-- Prevents the misleading Chrome extension warning that appeared when live-page mounting failed even though the fallback PDF succeeded.
-- Simplified the running UI to a progress bar without live message/media counters.
-- Persian/font-mirroring experiments are intentionally paused; v1.5.4 prioritizes reliable export behavior across ChatGPT, Claude, and Gemini.
-
-## Version 1.5.1
-
-- Prints from inside the live ChatGPT / Claude / Gemini document first, so fonts already loaded by the site or by another RTL/font extension remain available during printing.
-- Uses the exact computed font stack of the visible conversation and avoids overriding it with guessed webfont families.
-- Keeps the extension-origin print page as a fallback if live-page printing is blocked.
-- Simplifies the popup progress UI to a progress bar without message/media counters.
-- Completes the progress bar before opening Chrome print.
-
-## Version 1.4.0
-
-- Captures provider webfont faces and embeds font resources into the print document when available.
-- Detects loaded webfont families that cover Persian/Arabic text instead of copying only the CSS font-family stack.
-- Keeps system/provider font stacks as fallback when a font resource is inaccessible.
-- Holds the final progress state briefly so the completed message count is visible before the print tab activates.
+Licensed under MIT; see [LICENSE](LICENSE). ChatGPT, Claude, and Gemini are trademarks of their respective owners. ChatFolio is not affiliated with or endorsed by OpenAI, Anthropic or Google.
