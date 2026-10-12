@@ -1,3 +1,65 @@
+## v1.8.8 - Pagination and citation polish (pre-release candidate)
+
+- Keep the message label with its first actual content fragment, even when provider DOM adds nested wrappers. Long responses still paginate normally.
+- Add unobtrusive `current / total` page numbers in CSS page margin boxes, without allowing default Chrome headers/footers to return.
+- Separate compact source-reference overflow counters (`+2`, `+1`, etc.) from their source titles without changing text or URL targets.
+- Scanner, cancellation, identity, media extraction, and provider adapters are inherited unchanged from v1.8.7.
+
+## v1.8.7 - Print polish
+
+- Suppress Chrome browser print header/footer artifacts via empty CSS @page margin boxes on supported modern Chromium versions.
+- Improve table page breaks, move semantic TH row into THEAD when needed and repeat headers for long tables.
+- Collapse simple source preview wrappers into compact chips without dropping links, logos, or text.
+- Keep message labels attached to opening response content where Chrome print supports avoid-page hints.
+- Preserve scanner/Stop/identity logic unchanged from 1.8.6.
+
+## 1.8.6 (layout test build)
+- Targeted PDF pagination/white-space cleanup; no modifications to the now working ChatGPT negative-scroll scanner.
+- Remove provider CSS hooks from exported HTML except export-specific styles and KaTeX/code classes to prevent oversized ChatGPT cards from leaking layout heights into print.
+- Normalize residual inline flex/grid/aspect spacing and reduce forced figure keep-together pagination; remove visually hidden provider duplicates before class normalization.
+- Reduce overly generous exchange spacing and constrain ordinary response image height to 108mm.
+- Test with product-card/oversized-layout and multilingual table/image fixtures. Still requires real-chat validation.
+
+## 1.8.5 (candidate)
+- Detect signed-negative Chrome scrollTop on column-reverse scrollports. Normalize the scanned coordinate so 0 is the beginning, positive values advance through the chat; preserve the Stop/recovery/fullness checks.
+- Probe both positive and negative scroll directions before rejecting a scroller.
+- Record privacy-safe probe offsets and movement in the failure message.
+- No automatic switch to Visual Backup; no partial PDF on scan failure.
+- **This is a hypothesis-driven compatibility fix and must be validated on the user's actual Temporary Chat.**
+
+## 1.8.4 (2026-10-10) - conversation scrollport identification (test build)
+
+- Fixed the false-scrollport heuristic: a tall element is no longer assumed to be the conversation scroller just because it has a large `scrollHeight`. ChatFolio now probes and checks actual movement of authored message nodes (or a changed virtualized message frontier).
+- Added detection of candidate scrollports that are not DOM ancestors of the rendered messages, for portal-like renderers.
+- When repeated scroll commands are ignored, re-probe the currently mounted conversation instead of blindly repeating attempts.
+- When no candidate moves the conversation, fail promptly with scroller metadata (tag, id, overflow, top/range) rather than generating a partial PDF or opening Visual Backup automatically. Diagnostic metadata contains no conversation text.
+- Retained existing Stop, metadata export, image sizing, Claude and Gemini adapters.
+- Browser regression fixtures cover incorrect tall wrappers, virtualized 56/60-message scans, portal-like surfaces, blocked scrolling, and grouped assistant content.
+- A live export from the user's temporary ChatGPT conversation remains necessary before treating this version as release-ready.
+
+## v1.8.3 — Temporary Chat scanning and scroll recovery
+
+- Improve chat scroll container detection: prefer actual conversation movement over unrelated scrollTop changes.
+- Track unique virtualized content frontiers and furthest forward position; treat scroll anchoring jumps as expected, not instant fatal stalls.
+- Re-probe the active scroll container on stalls and use up to three bounded recovery passes.
+- Allow extra settling time for lazily rendered last messages.
+- When semantic extraction fails, do not unexpectedly launch Assisted Visual Backup; the user can still choose it explicitly.
+- Retain v1.8.2 fixes for grouped ChatGPT responses and image sizing.
+
+**Testing limitation:** Chrome Temporary Chat's real DOM is accessible only on the user's logged-in page. Local tests use simulated DOM/virtualization. Please verify full message coverage against the original conversation before publishing.
+
+# ChatFolio 1.8.2 (development hotfix)
+
+Based on the source of v1.8.0 supplied for this repair; v1.8.1 source was not supplied.
+
+- Corrected extraction of ChatGPT grouped-renderer assistant turns when `data-conversation-role="assistant"` contains only the `ChatGPT said:` label and reply content is in siblings.
+- Retained response images, tables, formatted content and preserved question/answer separation.
+- Added fail-closed validation for ChatGPT assistant labels without captured response content.
+- Preserved original rendered image widths and capped assistant content images and screenshots separately for A4 printing.
+- Avoided ordinary metadata requests on `temporary-chat=true` routes where full metadata may be unavailable.
+- Added bounded scan-start and confirmed-scan-end checks before publishing semantic exports.
+- Added mocked-browser regression tests and a one-page render test for the image limits.
+
 # ChatFolio 1.8.0
 
 - Replaced the unreliable automatic Visual Backup scroll crawler with an assisted capture workflow driven by real user scrolling.

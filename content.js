@@ -11,6 +11,11 @@
   const PLATFORM = detectPlatform();
   const ADAPTER = createPlatformAdapter(PLATFORM);
   const chatGPTAssetUrlCache = new Map();
+  // Some scrollports use column-reverse. Chromium then reports scrollTop
+  // in [-scrollRange, 0], with 0 being the *bottom*. Track only scrollports
+  // proven by the movement probe; other platforms keep their old behavior.
+  const reverseScrollports = new WeakSet();
+  const scrollerProbeRecords = new WeakMap();
 
 
   function clampNumber(value, min, max) {
@@ -146,7 +151,7 @@
       .then((result) => sendResponse({ ok: true, ...result }))
       .catch((error) => {
         const cancelled = isCancelledError(error) || activeExport?.cancelled;
-        if (!cancelled) console.warn(`${PLATFORM.name} export failed:`, error);
+        if (!cancelled) console.info(`ChatFolio: ${PLATFORM.name} export did not complete:`, error?.message || String(error));
         sendResponse({
           ok: false,
           cancelled,
@@ -346,9 +351,15 @@
             if (bubble) return bubble;
           }
           if (role === 'assistant') {
+            // In the 2026 grouped ChatGPT renderer the aria/role marker can be
+            // only the short "ChatGPT said:" caption. The actual reply (including
+            // images and DIL-rich content) can be in following sibling elements.
+            // Use the full ONE-exchange wrapper for capture; serializeTurn removes
+            // the user surface from an assistant capture before exporting it.
+            const group = node.closest?.(groupedTurnSelector);
+            if (group) return group;
             const roleNode = node.matches?.(groupedAssistantSelector) ? node : node.closest?.(groupedAssistantSelector);
             if (roleNode) return roleNode;
-            const group = node.closest?.(groupedTurnSelector);
             const body = findGroupedAssistantBody(group);
             if (body) return body;
           }
@@ -585,7 +596,8 @@
       if (marker < 0 || !parts[marker + 1]) return null;
       const conversationId = parts[marker + 1];
       const projectId = parts.slice(0, marker).find((part) => part.startsWith("g-p-")) || "";
-      return { conversationId, projectId, shareId: "", isShare: false };
+      return { conversationId, projectId, shareId: "", isShare: false,
+        isTemporary: url.searchParams.get('temporary-chat') === 'true' };
     } catch {
       return null;
     }
@@ -934,6 +946,7 @@
         metadata: message.metadata || null
       });
       if (!rendered.text && !rendered.html) return null;
+      validateSerializedAssistant({ ...rendered, imageCount: rendered.mediaCount }, role);
       return {
         key: `${keyPrefix}:${message.id || entry.nodeIndex}`,
         role,
@@ -1350,6 +1363,10 @@
     if (context.isShare && context.shareId) {
       return collectChatGPTShareViaMetadata(options, session, context);
     }
+    // Temporary ChatGPT conversations are not necessarily backed by the normal
+    // authenticated /backend-api/conversation/{id} resource (often HTTP 404).
+    // Do not waste time or treat that predictable 404 as evidence of an empty chat.
+    if (context.isTemporary) return null;
     const signal = session.controller.signal;
     throwIfCancelled(session);
 
@@ -1448,68 +1465,164 @@
     };
   }
 
+  // ChatGPT can have tall wrappers (scrollHeight > clientHeight) that are NOT
+  // scrollports. A candidate is usable only when its scroll actually moves the
+  // authored conversation. Never fall back to the largest scrollHeight alone.
   function collectScrollCandidates(messageNode, platformId = PLATFORM.id) {
     const list = [];
     const add = (node) => {
-      if (!node || list.includes(node)) return;
-      list.push(node);
+      if (!(node instanceof HTMLElement) || list.includes(node)) return;
+      if (scrollRange(node) > 16) list.push(node);
     };
-
     let current = messageNode;
     while (current && current !== document.body && current !== document.documentElement) {
-      if (current instanceof HTMLElement) {
-        const style = getComputedStyle(current);
-        const overflowY = style.overflowY;
-        if (scrollRange(current) > 24 || overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay") add(current);
-      }
+      add(current);
       current = current.parentElement;
     }
-
-    if (platformId === "gemini") {
-      add(document.querySelector("#chat-history"));
-      add(document.querySelector(".chat-history-scroll-container"));
-      add(document.querySelector("infinite-scroller"));
+    if (platformId === 'gemini') {
+      add(document.querySelector('#chat-history'));
+      add(document.querySelector('.chat-history-scroll-container'));
+      add(document.querySelector('infinite-scroller'));
     }
-    add(document.querySelector("main"));
+    // Some builds scroll the document, others an element under <main>.
+    const main = document.querySelector('main');
+    if (main?.contains(messageNode)) add(main);
+    if (platformId === 'chatgpt') {
+      // Newer thread renderers may portal authored turns into an element that is
+      // visually overlaid on the scrollport rather than nested inside it.
+      // Search bounded likely scrollports too, but the probe below will only
+      // select one if moving it actually changes the authored conversation.
+      const selectors = 'main [class*="overflow"], main [class*="scroll"], [data-scroll-container], [data-testid*="scroll"], [role="main"]';
+      const nearby = [...document.querySelectorAll(selectors)].filter((node) => {
+        if (!(node instanceof HTMLElement) || node === document.body) return false;
+        const box = node.getBoundingClientRect();
+        return box.width >= 260 && box.height >= 220 && scrollRange(node) > 24;
+      }).slice(0, 35);
+      for (const node of nearby) add(node);
+    }
     add(document.scrollingElement);
     add(document.documentElement);
-    return list.filter(Boolean);
+    return list;
+  }
+
+  function describeScroller(candidate) {
+    const style = getComputedStyle(candidate);
+    return {
+      tag: String(candidate.tagName || '').toLowerCase(),
+      id: (candidate.id || '').slice(0, 55),
+      overflow: style.overflowY,
+      top: Math.round(getScrollTop(candidate)),
+      range: Math.round(scrollRange(candidate))
+    };
+  }
+
+  async function probeConversationScroller(candidate, messageNode, signal) {
+    throwIfAbortedSignal(signal);
+    const range = scrollRange(candidate);
+    if (range <= 16) return null;
+    const style = getComputedStyle(candidate);
+    const prior = {
+      rawTop: Number(candidate.scrollTop || 0),
+      scrollBehavior: candidate.style.getPropertyValue('scroll-behavior'),
+      scrollBehaviorPriority: candidate.style.getPropertyPriority('scroll-behavior'),
+      overflowAnchor: candidate.style.getPropertyValue('overflow-anchor'),
+      overflowAnchorPriority: candidate.style.getPropertyPriority('overflow-anchor'),
+      scrollSnapType: candidate.style.getPropertyValue('scroll-snap-type'),
+      scrollSnapTypePriority: candidate.style.getPropertyPriority('scroll-snap-type')
+    };
+    const anchor = messageNode?.closest?.('[data-turn-key], [data-testid^="conversation-turn"], [data-turn-id-container]') || messageNode;
+    const initialFirstNode = dedupeNestedMessages(getMessageNodes())[0];
+    const initialFirst = initialFirstNode?.closest?.('[data-turn-key]')?.getAttribute('data-turn-key')
+      || initialFirstNode?.textContent?.slice(0, 120) || '';
+    const record = { tried: [], reverse: false, motion: 0, actual: 0 };
+    let best = null;
+    try {
+      candidate.style.setProperty('scroll-behavior', 'auto', 'important');
+      candidate.style.setProperty('overflow-anchor', 'none', 'important');
+      candidate.style.setProperty('scroll-snap-type', 'none', 'important');
+      const distance = Math.min(300, Math.max(110, range * 0.09));
+      // Probe both signs. On a column-reverse flex scrollport 0 means bottom
+      // and positive scrollTop is ALWAYS clamped to 0. The previous code tried
+      // positive only, mistaking a valid reversed viewport for an inert wrapper.
+      const targets = [...new Set([
+        Math.min(range, prior.rawTop + distance),
+        Math.max(-range, prior.rawTop - distance)
+      ])];
+      for (const target of targets) {
+        throwIfAbortedSignal(signal);
+        candidate.scrollTop = prior.rawTop;
+        await sleepWithAbort(50, signal);
+        const beforeY = Number(anchor?.getBoundingClientRect?.()?.top);
+        candidate.scrollTop = target;
+        await sleepWithAbort(180, signal);
+        const actual = Number(candidate.scrollTop || 0);
+        const moved = Math.abs(actual - prior.rawTop);
+        const afterY = Number(anchor?.getBoundingClientRect?.()?.top);
+        const motion = anchor?.isConnected && Number.isFinite(beforeY) && Number.isFinite(afterY)
+          ? Math.abs(afterY - beforeY) : 0;
+        const remounted = Boolean(anchor && !anchor.isConnected);
+        const afterFirstNode = dedupeNestedMessages(getMessageNodes())[0];
+        const afterFirst = afterFirstNode?.closest?.('[data-turn-key]')?.getAttribute('data-turn-key')
+          || afterFirstNode?.textContent?.slice(0, 120) || '';
+        const frontierChanged = Boolean(initialFirst && afterFirst && initialFirst !== afterFirst);
+        const linked = motion > 3 || remounted || frontierChanged;
+        record.tried.push({ requested: Math.round(target), actual: Math.round(actual), motion: Math.round(motion), linked });
+        const observation = { linked, motion, moved, target, actual, negative: actual < -2 || target < -2 && actual < -2 };
+        if (!best || (linked ? 100000 : 0) + motion * 15 + moved > (best.linked ? 100000 : 0) + best.motion * 15 + best.moved) best = observation;
+      }
+    } finally {
+      candidate.scrollTop = prior.rawTop;
+      for (const [prop, value, priority] of [
+        ['scroll-behavior', prior.scrollBehavior, prior.scrollBehaviorPriority],
+        ['overflow-anchor', prior.overflowAnchor, prior.overflowAnchorPriority],
+        ['scroll-snap-type', prior.scrollSnapType, prior.scrollSnapTypePriority]
+      ]) {
+        if (value) candidate.style.setProperty(prop, value, priority);
+        else candidate.style.removeProperty(prop);
+      }
+      await sleepWithAbort(65, signal);
+    }
+    record.reverse = Boolean(best?.linked && best?.negative);
+    record.motion = best?.motion || 0;
+    record.actual = best?.moved || 0;
+    scrollerProbeRecords.set(candidate, record);
+    if (record.reverse) reverseScrollports.add(candidate);
+    const linkedToConversation = Boolean(best?.linked);
+    return {
+      candidate, linkedToConversation, motion: best?.motion || 0,
+      actuallyScrolled: best?.moved || 0,
+      newMountedFrontier: Boolean(best?.linked && best?.motion <= 3),
+      score: (linkedToConversation ? 100000 : 0) + (best?.motion || 0) * 15
+        + (/(auto|scroll|overlay)/.test(style.overflowY) ? 200 : 0)
+        + (best?.moved || 0) + Math.log2(1 + range)
+    };
+  }
+
+  function throwIfAbortedSignal(signal) {
+    if (signal?.aborted) throw makeCancelledError();
   }
 
   async function resolveConversationScrollContainer(messageNode, platformId, signal) {
     const candidates = collectScrollCandidates(messageNode, platformId);
-    if (!candidates.length) return document.scrollingElement || document.documentElement;
-    let best = null;
-    let bestScore = -1;
-
+    const observations = [];
     for (const candidate of candidates) {
-      if (signal?.aborted) throw makeCancelledError();
-      const range = scrollRange(candidate);
-      if (range <= 2) continue;
-      const beforeTop = getScrollTop(candidate);
-      const beforeRect = messageNode?.getBoundingClientRect?.();
-      const delta = Math.min(180, Math.max(60, range * 0.08));
-      const target = beforeTop > Math.min(range * 0.5, delta + 5)
-        ? Math.max(0, beforeTop - delta)
-        : Math.min(range, beforeTop + delta);
-      setScrollTop(candidate, target);
-      await sleepWithAbort(70, signal);
-      const afterTop = getScrollTop(candidate);
-      const afterRect = messageNode?.getBoundingClientRect?.();
-      const topMotion = Math.abs(afterTop - beforeTop);
-      const rectMotion = beforeRect && afterRect ? Math.abs(afterRect.top - beforeRect.top) : 0;
-      setScrollTop(candidate, beforeTop);
-      await sleepWithAbort(20, signal);
-
-      const isDocument = candidate === document.scrollingElement || candidate === document.documentElement;
-      const score = Math.min(range, 100000) / 1000 + topMotion * 2 + rectMotion * 3 + (isDocument ? 1 : 0);
-      if ((topMotion > 2 || rectMotion > 2) && score > bestScore) {
-        best = candidate;
-        bestScore = score;
-      }
+      throwIfAbortedSignal(signal);
+      const observation = await probeConversationScroller(candidate, messageNode, signal);
+      if (observation) observations.push(observation);
     }
-
-    return best || candidates.find((node) => scrollRange(node) > 40) || document.scrollingElement || document.documentElement;
+    observations.sort((a,b) => b.score-a.score);
+    const good = observations.find((item) => item.linkedToConversation);
+    if (good) return good.candidate;
+    // For other providers, retain the original fallback while ChatGPT gets a
+    // safe explicit failure rather than scanning a nonfunctional wrapper.
+    if (platformId !== 'chatgpt') return observations[0]?.candidate || document.scrollingElement || document.documentElement;
+    const detail = candidates.map((node) => {
+      const info = describeScroller(node);
+      const probe = scrollerProbeRecords.get(node);
+      const attempts = (probe?.tried || []).map((a) => `${a.requested}>${a.actual};motion=${a.motion}`).join('|');
+      return `${info.tag}${info.id ? '#' + info.id : ''}[${info.overflow},${info.top}/${info.range},flex=${getComputedStyle(node).flexDirection},probe=${attempts || 'none'}]`;
+    }).join(' ');
+    throw new Error(`ChatFolio found ${candidates.length} tall elements but none moved the ChatGPT messages when probed. Scrollers: ${detail || 'none'}. Export stopped; the original conversation was not modified.`);
   }
 
   async function exportConversation(options, session) {
@@ -1595,8 +1708,11 @@
       if (!collected?.messages?.length) throw new Error("The semantic full-chat collector did not find any messages.");
     } catch (error) {
       if (isCancelledError(error)) throw error;
-      console.warn(`ChatFolio: semantic ${PLATFORM.name} export failed; switching to visual archive fallback.`, error);
-      return await runVisualArchiveFallback(options, session, error);
+      // Opening Assisted Visual Backup as a surprise after a scroll failure
+      // obscures the actual cause and can lead to a misleading incomplete file.
+      // It remains available as an explicit independent option in the popup.
+      console.info(`ChatFolio: semantic ${PLATFORM.name} export could not complete. Visual backup is a separate option:`, error?.message || String(error));
+      throw error;
     }
 
     notifyProgress({
@@ -1621,8 +1737,8 @@
       );
     } catch (error) {
       if (isCancelledError(error)) throw error;
-      console.warn("ChatFolio: semantic print document construction failed; switching to visual archive fallback.", error);
-      return await runVisualArchiveFallback(options, session, error);
+      console.info('ChatFolio: print document construction failed. No incomplete PDF was generated:', error?.message || String(error));
+      throw error;
     }
 
     throwIfCancelled(session);
@@ -2575,6 +2691,12 @@
   }
 
   async function collectEntireConversation(scrollContainer, options, session) {
+    // A React renderer may replace the actual chat scroller while scanning.
+    // Keep the current scroller mutable so a verified re-probe can recover.
+    let activeScroller = scrollContainer;
+    const alternateScrollerOriginalTops = new Map();
+    const visitedFrontiers = new Set();
+    let furthestObservedTop = 0;
     const messages = new Map();
     const processedMediaKeys = new Set();
     const stableSignatures = new Map();
@@ -2590,6 +2712,7 @@
     // Stall recovery below is the primary loop guard; this is only a final failsafe.
     const hardScanLimitMs = 10 * 60 * 1000;
 
+    try {
     const captureVisibleMessages = async () => {
       throwIfCancelled(session);
       assertSameConversation(session);
@@ -2633,7 +2756,7 @@
         }
 
         snapshotKeys.push(key);
-        updatePositionHint(positionHints, key, getMessageOrderHint(messageNode, scrollContainer));
+        updatePositionHint(positionHints, key, getMessageOrderHint(messageNode, activeScroller));
 
         if (messages.has(key)) {
           const existing = messages.get(key);
@@ -2683,14 +2806,14 @@
     while (stableTopRounds < 3 && topLoadRounds < 40 && Date.now() - topLoadStartedAt < 25000) {
       throwIfCancelled(session);
       assertSameConversation(session);
-      setScrollTop(scrollContainer, 0);
+      setScrollTop(activeScroller, 0);
       await sleepWithAbort(520, signal);
 
       const currentNodes = dedupeNestedMessages(getMessageNodes());
       const firstNode = currentNodes.length ? currentNodes[0] : null;
       const firstText = normalizeText(firstNode?.innerText || firstNode?.textContent || "").slice(0, 180);
-      const currentHeight = Math.round(getScrollHeight(scrollContainer));
-      const atTop = getScrollTop(scrollContainer) <= 4;
+      const currentHeight = Math.round(getScrollHeight(activeScroller));
+      const atTop = getScrollTop(activeScroller) <= 4;
       const signature = `${currentHeight}|${currentNodes.length}|${simpleHash(firstText)}`;
       if (atTop && signature === previousTopSignature) stableTopRounds += 1;
       else stableTopRounds = 0;
@@ -2708,14 +2831,23 @@
       }
     }
 
-    let lastGrowthAt = Date.now();
+    if (stableTopRounds < 3 && getScrollTop(activeScroller) > 4) {
+      throw new Error('The start of the conversation could not be reached reliably. Export stopped instead of silently omitting older messages.');
+    }
+
     let lastProgressAt = Date.now();
+    furthestObservedTop = getScrollTop(activeScroller);
     let bottomStableRounds = 0;
+    let verifiedBottom = false;
     let recoveryAttempts = 0;
-    let lastTop = getScrollTop(scrollContainer);
-    let lastObservedTop = lastTop;
-    let lastObservedHeight = getScrollHeight(scrollContainer);
+    let lastTop = getScrollTop(activeScroller);
     let lastRequestedTop = lastTop;
+    let consecutiveBlockedMoves = 0;
+    let scrollDiagnostics = '';
+    if (reverseScrollports.has(activeScroller)) {
+      notifyProgress({ percent: 4, messageCount: 0, imageCount: 0,
+        status: 'Detected reversed conversation scrollbar; scanning from visual beginning...', running: true });
+    }
     const maxSteps = PLATFORM.id === "gemini" ? 700 : 1200;
 
     for (let step = 0; step < maxSteps; step += 1) {
@@ -2727,25 +2859,44 @@
 
       const added = await captureVisibleMessages();
       if (added > 0) {
-        lastGrowthAt = Date.now();
         lastProgressAt = Date.now();
         recoveryAttempts = 0;
       }
 
-      const top = getScrollTop(scrollContainer);
-      const height = getScrollHeight(scrollContainer);
-      const viewport = getClientHeight(scrollContainer);
-      const forwardMotion = top > lastObservedTop + Math.max(28, viewport * 0.025);
-      const heightChanged = Math.abs(height - lastObservedHeight) > 12;
-      if (forwardMotion || heightChanged) lastProgressAt = Date.now();
+      const top = getScrollTop(activeScroller);
+      const height = getScrollHeight(activeScroller);
+      const viewport = getClientHeight(activeScroller);
+      // Track *new* forward coverage, not simply top oscillating between two
+      // positions while the virtualized page keeps resetting the scroll anchor.
+      const forwardMotion = top > furthestObservedTop + Math.max(24, viewport * 0.025);
+      if (forwardMotion) {
+        furthestObservedTop = top;
+        lastProgressAt = Date.now();
+      }
+      // A fixed-height virtual list can move through different messages without
+      // increasing scrollTop. A previously unseen visible tail is real progress.
+      const frontierNodes = dedupeNestedMessages(getMessageNodes());
+      const frontierNode = frontierNodes[frontierNodes.length - 1];
+      const frontierRaw = String(frontierNode?.innerText || frontierNode?.textContent || '').slice(-500);
+      const frontierId = frontierNode?.closest?.('[data-turn-key]')?.getAttribute?.('data-turn-key') || '';
+      if (frontierNode && (frontierRaw.trim() || frontierId)) {
+        const frontierKey = simpleHash(`${frontierId}|${getMessageRole(frontierNode)}|${frontierRaw}`);
+        if (!visitedFrontiers.has(frontierKey)) {
+          visitedFrontiers.add(frontierKey);
+          lastProgressAt = Date.now();
+        }
+      }
       const maxTop = Math.max(0, height - viewport);
       const fraction = maxTop > 0 ? Math.min(1, Math.max(0, top / maxTop)) : 1;
       const physicalBottom = maxTop - top <= Math.max(8, viewport * 0.035);
-      const logicalEndVisible = Boolean(ADAPTER.isAtConversationEnd?.(scrollContainer));
+      const logicalEndVisible = Boolean(ADAPTER.isAtConversationEnd?.(activeScroller));
       // Use the DOM-visible end only as a fallback when a requested forward scroll
       // is being ignored. This avoids mistaking a virtualized viewport chunk for
       // the true end of a long Gemini/Claude conversation.
-      const logicalBottom = logicalEndVisible && lastRequestedTop > top + 60 && (Date.now() - lastProgressAt) > 900;
+      // In temporary ChatGPT chats, the last *mounted* turn can appear near the
+      // viewport bottom even though many older/newer turns exist outside the
+      // virtualized window. Never infer completion solely from that visible node.
+      const logicalBottom = PLATFORM.id !== 'chatgpt' && logicalEndVisible && lastRequestedTop > top + 60 && (Date.now() - lastProgressAt) > 900;
       const atBottom = physicalBottom || logicalBottom;
 
       notifyProgress({
@@ -2758,17 +2909,22 @@
 
       if (atBottom && added === 0) bottomStableRounds += 1;
       else bottomStableRounds = 0;
-      if (bottomStableRounds >= (PLATFORM.id === "gemini" ? 2 : 4)) break;
+      // Wait long enough for ChatGPT lazy-rendered final turns to appear. A
+      // one-second quiet period is often not enough on temporary conversations.
+      if (atBottom && PLATFORM.id === 'chatgpt') await sleepWithAbort(450, signal);
+      if (bottomStableRounds >= (PLATFORM.id === "gemini" ? 2 : (PLATFORM.id === 'chatgpt' ? 6 : 4))) {
+        verifiedBottom = true;
+        break;
+      }
 
-      const noGrowthMs = Date.now() - lastGrowthAt;
       const noProgressMs = Date.now() - lastProgressAt;
-      const movedBackwardUnexpectedly = top + Math.max(80, viewport * 0.18) < lastTop && lastRequestedTop > lastTop;
-
-      if (!atBottom && (noProgressMs >= 7500 || (movedBackwardUnexpectedly && noGrowthMs >= 1800))) {
+      // Scroll anchoring can jump backwards harmlessly while ChatGPT replaces
+      // virtual nodes. Do not count every such jump as an immediate fatal stall.
+      if (!atBottom && noProgressMs >= 10500) {
         recoveryAttempts += 1;
-        if (recoveryAttempts > 2) {
+        if (recoveryAttempts > 3) {
           throw new Error(
-            `The scanner became stuck after finding ${messages.size} messages. It stopped safely instead of looping forever. Retry the export; if it happens again, press Stop scan and refresh the AI chat tab.`
+            `ChatFolio could not advance the conversation after finding ${messages.size} messages (scroller ${Math.round(getScrollTop(activeScroller))}/${Math.round(scrollRange(activeScroller))}, ${visitedFrontiers.size} distinct visible frontiers). ${scrollDiagnostics ? scrollDiagnostics + ' ' : ''}Export stopped without creating an incomplete PDF. You can retry, or choose Visual backup manually.`
           );
         }
 
@@ -2776,33 +2932,101 @@
           percent: Math.max(5, Math.min(90, 5 + Math.round(fraction * 85))),
           messageCount: messages.size,
           imageCount,
-          status: `No scan progress detected. Recovery attempt ${recoveryAttempts}/2...`,
+          status: `Chat scrolling stalled; recovery ${recoveryAttempts}/3...`,
           running: true
         });
 
-        await recoverForwardScan(scrollContainer, recoveryAttempts, signal);
-        lastGrowthAt = Date.now();
+        // If ChatGPT moved its scrolling viewport to another wrapper during a
+        // React remount, re-probe using the *currently mounted* message nodes.
+        const currentNodes = dedupeNestedMessages(getMessageNodes());
+        let replacement = null;
+        if (currentNodes.length) {
+          replacement = await resolveConversationScrollContainer(currentNodes[currentNodes.length - 1], PLATFORM.id, signal);
+        }
+        if (replacement && replacement !== activeScroller && scrollRange(replacement) > 40) {
+          if (!alternateScrollerOriginalTops.has(replacement)) {
+            alternateScrollerOriginalTops.set(replacement, {
+              top: getScrollTop(replacement),
+              scrollBehavior: replacement.style?.scrollBehavior || '',
+              overflowAnchor: replacement.style?.overflowAnchor || '',
+              scrollSnapType: replacement.style?.scrollSnapType || ''
+            });
+          }
+          activeScroller = replacement;
+          if (activeScroller?.style) {
+            activeScroller.style.scrollBehavior = 'auto';
+            activeScroller.style.overflowAnchor = 'none';
+            activeScroller.style.scrollSnapType = 'none';
+          }
+          furthestObservedTop = getScrollTop(activeScroller);
+        }
+        await recoverForwardScan(activeScroller, recoveryAttempts, signal);
         lastProgressAt = Date.now();
-        lastTop = getScrollTop(scrollContainer);
-        lastObservedTop = lastTop;
-        lastObservedHeight = getScrollHeight(scrollContainer);
+        lastTop = getScrollTop(activeScroller);
         lastRequestedTop = lastTop;
         continue;
       }
 
       lastTop = top;
-      lastObservedTop = top;
-      lastObservedHeight = height;
       const stepSize = Math.max(320, viewport * (PLATFORM.id === "gemini" ? 0.62 : 0.78));
       const nextTop = Math.min(maxTop, Math.max(top + stepSize, lastRequestedTop + 120));
       lastRequestedTop = nextTop;
-      setScrollTop(scrollContainer, nextTop);
+      const beforeMovement = getScrollTop(activeScroller);
+      const beforeAnchor = frontierNode?.closest?.('[data-turn-key]') || frontierNode;
+      const beforeAnchorTop = beforeAnchor?.getBoundingClientRect?.()?.top;
+      setScrollTop(activeScroller, nextTop);
       await sleepWithAbort(PLATFORM.id === "gemini" ? 380 : 300, signal);
+      if (PLATFORM.id === 'chatgpt' && !atBottom) {
+        const afterMovement = getScrollTop(activeScroller);
+        const afterAnchorTop = beforeAnchor?.getBoundingClientRect?.()?.top;
+        const changedMessages = beforeAnchor && !beforeAnchor.isConnected;
+        const contentMoved = changedMessages || (Number.isFinite(beforeAnchorTop) && Number.isFinite(afterAnchorTop) && Math.abs(afterAnchorTop - beforeAnchorTop) > 3);
+        if (Math.abs(afterMovement - beforeMovement) < 3 && !contentMoved) consecutiveBlockedMoves += 1;
+        else consecutiveBlockedMoves = 0;
+        if (consecutiveBlockedMoves >= 2) {
+          // Do not wait 40 seconds while stuck on a false scrollport. Ask the
+          // moving-message probe again, with a freshly mounted message anchor.
+          const mounted = dedupeNestedMessages(getMessageNodes());
+          const anchor = mounted[Math.floor(mounted.length / 2)] || mounted[0];
+          let replacement = null;
+          try {
+            replacement = anchor ? await resolveConversationScrollContainer(anchor, PLATFORM.id, signal) : null;
+          } catch (error) {
+            scrollDiagnostics = error.message || String(error);
+          }
+          if (replacement && replacement !== activeScroller) {
+            if (!alternateScrollerOriginalTops.has(replacement)) {
+              alternateScrollerOriginalTops.set(replacement, {
+                top: getScrollTop(replacement),
+                scrollBehavior: replacement.style?.scrollBehavior || '',
+                overflowAnchor: replacement.style?.overflowAnchor || '',
+                scrollSnapType: replacement.style?.scrollSnapType || ''
+              });
+            }
+            activeScroller = replacement;
+            activeScroller.style.scrollBehavior = 'auto';
+            activeScroller.style.overflowAnchor = 'none';
+            activeScroller.style.scrollSnapType = 'none';
+            furthestObservedTop = getScrollTop(activeScroller);
+            lastRequestedTop = furthestObservedTop;
+            lastProgressAt = Date.now();
+            consecutiveBlockedMoves = 0;
+            notifyProgress({ percent: 6, messageCount: messages.size, imageCount, status: 'Reconnected to the conversation scroll area...', running: true });
+            continue;
+          }
+          // A genuine scroller can still be blocked by the host page. Do not
+          // report false success; recovery will try its bounded alternatives.
+          consecutiveBlockedMoves = 0;
+        }
+      }
     }
 
+    if (!verifiedBottom) {
+      throw new Error(`The scanner did not verify the end of the ${PLATFORM.name} conversation. Export stopped to avoid a partial archive.`);
+    }
     throwIfCancelled(session);
     assertSameConversation(session);
-    setScrollTop(scrollContainer, getScrollHeight(scrollContainer));
+    setScrollTop(activeScroller, getScrollHeight(activeScroller));
     await sleepWithAbort(650, signal);
     await captureVisibleMessages();
 
@@ -2842,24 +3066,35 @@
     }
 
     return { messages: ordered, imageCount, processedMediaKeys, identityCollisions };
+    } finally {
+      for (const [alternate, original] of alternateScrollerOriginalTops) {
+        setScrollTop(alternate, original.top);
+        if (alternate?.style) {
+          alternate.style.scrollBehavior = original.scrollBehavior;
+          alternate.style.overflowAnchor = original.overflowAnchor;
+          alternate.style.scrollSnapType = original.scrollSnapType;
+        }
+      }
+    }
   }
 
   async function recoverForwardScan(scrollContainer, attempt, signal) {
     const viewport = getClientHeight(scrollContainer);
-    if (attempt === 1) {
+    if (attempt <= 2) {
       const nodes = dedupeNestedMessages(getMessageNodes());
       const lastNode = nodes[nodes.length - 1];
-      try { lastNode?.scrollIntoView({ block: "end", behavior: "auto" }); } catch {}
-      await sleepWithAbort(180, signal);
-      setScrollTop(scrollContainer, getScrollTop(scrollContainer) + Math.max(420, viewport * 1.15));
-      await sleepWithAbort(700, signal);
+      try { lastNode?.scrollIntoView({ block: attempt === 1 ? "end" : "start", behavior: "instant" }); } catch {}
+      await sleepWithAbort(250, signal);
+      const current = getScrollTop(scrollContainer);
+      setScrollTop(scrollContainer, current + Math.max(460, viewport * (attempt === 1 ? 0.9 : 1.5)));
+      await sleepWithAbort(1000, signal);
       return;
     }
 
-    // Second and final recovery: probe the true end once. If virtualization still
-    // pulls us backwards, the caller aborts safely rather than entering a loop.
+    // Last bounded recovery probes the real scrollbar end. If the page keeps
+    // snapping back, fail with a clear error, not another automatic overlay.
     setScrollTop(scrollContainer, getScrollHeight(scrollContainer));
-    await sleepWithAbort(950, signal);
+    await sleepWithAbort(1200, signal);
   }
 
   function getMessageNodes() {
@@ -3018,17 +3253,25 @@
     let stableId = explicitCandidates.find((value) => looksUniqueDomId(value)) || "";
     if (!stableId && Number.isFinite(turnIndex)) stableId = `turn:${turnIndex}`;
 
-    const text = normalizeText(messageNode.innerText || turn?.innerText || "").slice(0, 2400);
+    // A ChatGPT role marker may contain only "ChatGPT said:"; fingerprint the
+    // complete exchange in that situation so distinct responses are not silently
+    // deduplicated under the same generic label during virtualized scrolling.
+    const roleMarkerText = normalizeText(messageNode.innerText || messageNode.textContent || "");
+    const identityText = PLATFORM.id === "chatgpt" && role === "assistant" &&
+      isChatGPTAssistantLabelOnly(roleMarkerText) && turn?.matches?.('[data-turn-key]')
+      ? (turn.innerText || turn.textContent || "")
+      : (messageNode.innerText || turn?.innerText || "");
+    const text = normalizeText(identityText).slice(0, 2400);
     const mediaSignature = [...(turn?.querySelectorAll?.("img") || [])]
       .map((img) => img.currentSrc || img.src || img.getAttribute("alt") || "")
       .join("|")
       .slice(0, 1400);
-    const nearbyRaw = ADAPTER.nearbyIdentityText?.(messageNode, turn, role) || "";
-    // Context helps distinguish repeated short prompts such as "continue", but
-    // including neighboring text for every long message makes fingerprints
-    // unstable at virtualization boundaries.
-    const nearby = text.length < 80 ? nearbyRaw : "";
-    const signature = simpleHash(`${platformId}|${role}|${text}|${mediaSignature}|${nearby}`);
+    // Never put neighboring message content into the identity signature.
+    // Virtualized conversations mount/unmount adjacent turns while scrolling,
+    // so the same stable message ID would appear to "collide" with itself and
+    // be exported two or more times. Repeated identical messages are separated
+    // by their stable IDs or their per-snapshot occurrence index below.
+    const signature = simpleHash(`${platformId}|${role}|${text}|${mediaSignature}`);
     const fingerprintKey = `${platformId}:${role}:fp:${signature}${text || mediaSignature ? "" : `:${fallbackOrder}`}`;
     const strongKey = stableId ? `${platformId}:${role}:id:${stableId}` : "";
 
@@ -3075,6 +3318,42 @@
     }
   }
 
+  function isChatGPTAssistantLabelOnly(value) {
+    return /^(?:chatgpt\s+said|assistant\s+(?:response|message))\s*:?$/i.test(normalizeText(value));
+  }
+
+  function stripGroupedChatGPTUserFromAssistant(root) {
+    // The wrapper is a full exchange, not one authored response. Exclude the
+    // question/upload subtree while retaining ALL response siblings, even when
+    // the assistant marker itself has no body text.
+    root.querySelectorAll([
+      '[data-user-message-bubble]',
+      '[data-message-author-role="user"]',
+      '[data-conversation-role="user"]',
+      '[data-role="user"]'
+    ].join(',')).forEach((element) => element.remove());
+
+    // A few grouped layouts put an accessibility caption into a separate DOM
+    // node. Do not publish the caption as if it were the whole answer.
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const labels = [];
+    let textNode;
+    while ((textNode = walker.nextNode())) {
+      if (isChatGPTAssistantLabelOnly(textNode.nodeValue || '')) labels.push(textNode);
+    }
+    labels.forEach((node) => node.remove());
+  }
+
+  function validateSerializedAssistant(serialized, role) {
+    if (PLATFORM.id !== 'chatgpt' || role !== 'assistant') return;
+    const text = normalizeText(serialized.text || '').replace(/^(?:chatgpt\s+said|assistant\s+(?:response|message))\s*:?/i, '').trim();
+    const media = Number(serialized.imageCount || 0) > 0 ||
+      /<(?:img|svg|video|audio|math)\b|class=["'][^"']*(?:attachment-card|export-attachment|export-writing-block)/i.test(serialized.html || '');
+    if (!text && !media) {
+      throw new Error('ChatGPT reply content was not captured (only its UI label was found). Semantic export was stopped to prevent an incomplete PDF.');
+    }
+  }
+
   async function serializeTurn(turn, messageNode, role, embedImages, signal) {
     if (signal?.aborted) throw makeCancelledError();
     const source = turn || messageNode;
@@ -3090,9 +3369,8 @@
     }));
 
     // Provider UIs can keep alternate/accessible renderings in the DOM and hide
-    // them only with site CSS. Those hidden copies become visible when cloned into
-    // ChatFolio's standalone print document. Remove elements that are actually
-    // hidden in the live Gemini user turn before provider CSS is lost.
+    // them via site CSS. Before removing provider classes, discard these hidden
+    // copies for all platforms so they cannot reappear as duplicate print text.
     pruneInvisibleProviderClone(source, clone, role);
     await sleepWithAbort(0, signal);
 
@@ -3118,6 +3396,10 @@
         cloneCanvases[i].remove();
       }
     }
+
+    const isGroupedChatGPTAssistant = PLATFORM.id === 'chatgpt' && role === 'assistant' &&
+      source.matches?.('[data-turn-key]');
+    if (isGroupedChatGPTAssistant) stripGroupedChatGPTUserFromAssistant(clone);
 
     // Preserve authored rich content before generic UI cleanup. Writing blocks can be
     // contenteditable regions or same-origin iframes; removing them would leave only
@@ -3154,6 +3436,20 @@
         }
       }
       cloneImg.setAttribute("data-export-image-kind", imageKind);
+      // Provider-controlled CSS disappears in the standalone print document.
+      // Save the LIVE displayed width before removing layout styles; otherwise
+      // a 200px product image expands to its multi-thousand-pixel intrinsic size.
+      const liveRect = sourceImg.getBoundingClientRect?.();
+      const liveWidth = Math.round(Number(liveRect?.width || 0));
+      if (liveWidth >= 32 && liveWidth <= 2400) {
+        cloneImg.style.setProperty('--chatfolio-image-width', `${liveWidth}px`);
+      }
+      const liveHeight = Number(liveRect?.height || 0);
+      const ratio = liveHeight > 0 ? liveWidth / liveHeight : 0;
+      if (imageKind === 'export-content-image' &&
+        (ratio >= 1.42 || /(?:screenshot|screen\s*shot|capture)/i.test(sourceImg.alt || ''))) {
+        cloneImg.classList.add('export-response-screenshot');
+      }
       if (imageKind !== "export-preview-logo") meaningfulImageCount += 1;
 
       cloneImg.removeAttribute("srcset");
@@ -3232,8 +3528,18 @@
       }
 
       sanitizeInlineLayout(node);
+      // Provider utility classes (Tailwind/DIL/responsive product grids) must not
+      // survive into the live-page print tree. Their site CSS is still loaded and
+      // can create 600px spacers, large min-heights and forced page fragmentation.
+      // Keep ChatFolio's classes and math/code syntax classes only.
+      removeProviderPresentationHooks(node);
     }
 
+    // Only transform the already-captured print clone. Never rewrite the live
+    // chat or the scanner's message/identity logic.
+    preparePrintableTables(clone);
+    compactSourcePreviews(clone);
+    spaceSourceReferenceCounters(clone);
     applyDirectionality(clone);
     removeEmptyUiRemnants(clone);
     trimTrailingEmptyContent(clone);
@@ -3244,14 +3550,15 @@
     const html = clone.innerHTML.trim();
     const plainText = normalizeText(clone.textContent || messageNode.innerText || source.innerText || "");
     const fallback = escapeHtml(plainText);
-
-    return {
+    const serialized = {
       html: html || `<p dir="auto">${fallback || "[Media-only message]"}</p>`,
       text: plainText,
       imageCount: meaningfulImageCount,
       embeddedImageCount,
       mediaKeys
     };
+    validateSerializedAssistant(serialized, role);
+    return serialized;
   }
 
   function preserveEditableRegions(root) {
@@ -3447,7 +3754,7 @@
   }
 
   function pruneInvisibleProviderClone(source, clone, role) {
-    if (PLATFORM.id !== "gemini" || role !== "user" || !source || !clone) return;
+    if (!source || !clone) return;
 
     const sourceNodes = [...source.querySelectorAll("*")];
     const cloneNodes = [...clone.querySelectorAll("*")];
@@ -3459,9 +3766,12 @@
       const sourceNode = sourceNodes[i];
       const cloneNode = cloneNodes[i];
       if (!cloneNode?.isConnected && !clone.contains(cloneNode)) continue;
+      if (sourceNode.closest?.('.katex, .katex-display, math')) continue;
+      // Closed details are explicitly expanded in the print clone later.
+      if (sourceNode.closest?.('details:not([open])')) continue;
 
       let hidden = sourceNode.hidden || sourceNode.getAttribute?.("aria-hidden") === "true";
-      if (!hidden) {
+      if (!hidden && (sourceNode.hasAttribute?.('class') || sourceNode.hasAttribute?.('style'))) {
         try {
           const style = window.getComputedStyle(sourceNode);
           hidden = style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse";
@@ -3845,6 +4155,33 @@
     return "export-content-image";
   }
 
+  function removeProviderPresentationHooks(node) {
+    if (!(node instanceof Element)) return;
+    // KaTeX depends on dozens of internal classes and data attributes to lay out
+    // glyphs correctly; never flatten the semantic math renderer.
+    if (node.matches('.katex, .katex *')) return;
+
+    if (node.hasAttribute('class')) {
+      const kept = [...node.classList].filter((name) =>
+        name.startsWith('export-') || name.startsWith('chatfolio-') ||
+        name === 'katex-display' || name === 'math-display' ||
+        name === 'math-inline' || name === 'hljs' ||
+        name.startsWith('language-') || name.startsWith('hljs-')
+      );
+      if (kept.length) node.setAttribute('class', kept.join(' '));
+      else node.removeAttribute('class');
+    }
+    // Site-side attribute selectors can reintroduce position/size constraints
+    // even after class names are dropped. Exported images retain their kind tag.
+    for (const attribute of [...node.attributes]) {
+      if (attribute.name.startsWith('data-') &&
+          !attribute.name.startsWith('data-export-') &&
+          !attribute.name.startsWith('data-chatfolio-')) {
+        node.removeAttribute(attribute.name);
+      }
+    }
+  }
+
   function sanitizeInlineLayout(node) {
     if (!(node instanceof HTMLElement)) return;
     if (node.closest(".katex, .katex-display, math")) return;
@@ -3855,14 +4192,108 @@
       "width", "height", "min-width", "min-height", "max-width", "max-height",
       "position", "top", "right", "bottom", "left", "inset", "transform",
       "translate", "scale", "rotate", "overflow", "overflow-x", "overflow-y",
-      "text-align", "float", "clear"
+      "text-align", "float", "clear", "aspect-ratio", "order",
+      "flex", "flex-grow", "flex-shrink", "flex-basis", "flex-direction", "flex-wrap",
+      "grid", "grid-template-columns", "grid-template-rows", "grid-column", "grid-row",
+      "grid-auto-flow", "gap", "row-gap", "column-gap", "align-items", "align-self",
+      "justify-content", "justify-items", "place-items", "place-content",
+      "margin", "margin-top", "margin-bottom", "margin-left", "margin-right",
+      "margin-inline", "margin-block", "padding", "padding-top", "padding-bottom",
+      "padding-left", "padding-right", "padding-inline", "padding-block"
     ]);
 
     for (const prop of [...node.style]) {
-      if (blocked.has(prop)) node.style.removeProperty(prop);
+      // Keep display:none and semantic inline/block display. Remove flex/grid
+      // formatting only: it belongs to the responsive app, not a print report.
+      if (prop === "display" && /^(?:inline-)?(?:grid|flex)$/i.test(node.style.display)) {
+        node.style.removeProperty(prop);
+      } else if (blocked.has(prop) || /^(?:contain|content-visibility|container-type|contain-intrinsic-size|scroll-snap-)/.test(prop)) {
+        node.style.removeProperty(prop);
+      }
     }
 
     if (!node.getAttribute("style")?.trim()) node.removeAttribute("style");
+  }
+
+  function preparePrintableTables(root) {
+    // Chrome repeats a real THEAD across printed pages, but cannot reliably
+    // repeat a first row of TH cells left inside TBODY. Preserve row/cell data.
+    for (const table of root.querySelectorAll('table')) {
+      if (!table.tHead) {
+        const firstBody = table.tBodies[0];
+        const firstRow = firstBody?.rows?.[0];
+        if (firstRow && firstRow.cells.length > 0 &&
+          [...firstRow.cells].every((cell) => cell.tagName === 'TH')) {
+          const head = table.createTHead();
+          head.appendChild(firstRow);
+        }
+      }
+      const rows = [...table.tBodies].reduce((sum, body) => sum + body.rows.length, 0);
+      // Small tabular blocks look untidy when their header lands on page 1
+      // and two data rows land on page 2. Keep only genuinely small tables
+      // together; large ones must be free to flow with their repeated header.
+      const cellsTextLength = (table.textContent || '').length;
+      const safeToKeep = rows > 0 && rows <= 5 && cellsTextLength < 950 &&
+        !table.querySelector('img.export-user-media, img.export-content-image, pre, .katex-display');
+      table.classList.add(safeToKeep ? 'export-table-short' : 'export-table-long');
+    }
+  }
+
+  function compactSourcePreviews(root) {
+    // Modern provider result cards often nest a tiny favicon and the source
+    // title in multiple DIVs. Keep the original link and image intact, but
+    // style ONLY the compact source card rather than inheriting its page layout.
+    for (const img of root.querySelectorAll('img.export-preview-logo')) {
+      let current = img.parentElement;
+      let card = null;
+      for (let depth = 0; current && current !== root && depth < 6; depth += 1) {
+        if (!['DIV', 'A', 'SPAN', 'FIGURE'].includes(current.tagName)) break;
+        if (current.querySelectorAll('img').length !== 1 ||
+          current.querySelector('table, pre, h1, h2, h3, h4, h5, h6, ul, ol, blockquote')) break;
+        const text = normalizeText(current.textContent || '');
+        if (text.length > 78 || current.querySelectorAll('a[href]').length > 1) break;
+        if (text.length > 0 && current !== img &&
+            (current.tagName === 'A' || current.tagName === 'DIV' || current.tagName === 'FIGURE')) {
+          card = current;
+        }
+        current = current.parentElement;
+      }
+      if (card && card !== root && !card.closest('.export-attachment, .export-media-wrapper')) {
+        card.classList.add('export-source-chip');
+        // Nested chips create unwanted borders and spacing. A single outer
+        // chip is enough for the source favicon plus its visible text/link.
+        card.querySelectorAll('.export-source-chip').forEach((nested) => nested.classList.remove('export-source-chip'));
+      }
+    }
+  }
+
+  function spaceSourceReferenceCounters(root) {
+    // Citation source cards sometimes render as `example.com+2` because the
+    // provider's former flex gap disappears with its utility classes. Create a
+    // print-only gap without editing the text or the destination of the link.
+    for (const card of root.querySelectorAll('.export-source-chip, .export-source-ref')) {
+      const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
+      const texts = [];
+      while (walker.nextNode()) texts.push(walker.currentNode);
+      for (const node of texts) {
+        if (!node.parentNode || node.parentElement?.closest('.export-source-extra-count')) continue;
+        const value = node.nodeValue || '';
+        const match = /^(.*?)(\+\s*\d{1,3})(\s*)$/.exec(value);
+        if (!match || !match[1].trim()) {
+          if (!/^\s*\+\s*\d{1,3}\s*$/.test(value)) continue;
+          const counter = document.createElement('span');
+          counter.className = 'export-source-extra-count';
+          counter.textContent = value.trim();
+          node.replaceWith(counter);
+          continue;
+        }
+        const label = document.createTextNode(match[1]);
+        const counter = document.createElement('span');
+        counter.className = 'export-source-extra-count';
+        counter.textContent = match[2];
+        node.replaceWith(label, counter, document.createTextNode(match[3]));
+      }
+    }
   }
 
   function applyDirectionality(root) {
@@ -4043,16 +4474,21 @@
   }
 
   function getScrollTop(element) {
-    return Number(element?.scrollTop || 0);
+    const raw = Number(element?.scrollTop || 0);
+    // Normalized coordinate, always 0 at visual start and +range at end.
+    // A verified reversed scrollport exposes raw values [-range, 0].
+    return reverseScrollports.has(element) ? raw + scrollRange(element) : raw;
   }
 
   function setScrollTop(element, value) {
     if (!element) return;
-    const top = Math.max(0, Number(value) || 0);
+    const range = scrollRange(element);
+    const top = Math.max(0, Math.min(range, Number(value) || 0));
+    const raw = reverseScrollports.has(element) ? top - range : top;
     try {
-      element.scrollTo({ top, behavior: "auto" });
+      element.scrollTo({ top: raw, behavior: "auto" });
     } catch {
-      element.scrollTop = top;
+      element.scrollTop = raw;
     }
   }
 
@@ -4446,6 +4882,87 @@
     return `${clean}, ${fallback}`;
   }
 
+  function splitPrintableMessageOpening(html) {
+    // Keep the role badge and the FIRST authored content unit in one unbreakable
+    // print fragment. break-after:avoid on the badge alone fails when ChatGPT
+    // nests screenshots/paragraphs several divs deep. Never keep a whole long
+    // message together: doing so would reintroduce large empty page regions.
+    const root = document.createElement('div');
+    root.innerHTML = html;
+    const front = document.createElement('div');
+    const atomic = new Set([
+      'P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'IMG', 'PICTURE',
+      'FIGURE', 'PRE', 'BLOCKQUOTE', 'SVG', 'MATH', 'LI'
+    ]);
+    const structural = new Set(['DIV', 'SECTION', 'ARTICLE', 'SPAN', 'A', 'UL', 'OL', 'LABEL']);
+    const visible = (node) => node.nodeType === Node.TEXT_NODE
+      ? Boolean((node.nodeValue || '').trim())
+      : node.nodeType === Node.ELEMENT_NODE && (
+          Boolean((node.textContent || '').trim()) ||
+          Boolean(node.querySelector('img, svg, math, video, canvas, pre, table')) ||
+          ['IMG','SVG','MATH','TABLE','PRE'].includes(node.tagName)
+        );
+
+    function firstUnit(parent) {
+      for (const child of [...parent.childNodes]) {
+        if (!visible(child)) continue;
+        if (child.nodeType === Node.TEXT_NODE) return child;
+        if (!(child instanceof Element)) continue;
+        if (child.tagName === 'TABLE') return null; // never force a long table to stay on one page
+        // A favicon + hostname + +N counter is one semantic linked source.
+        // Never peel only its first IMG into the opening fragment.
+        if ((child.matches('.export-source-chip, .export-source-ref') ||
+            (child.tagName === 'A' && child.querySelector('img.export-preview-logo'))) &&
+            (child.textContent || '').length < 170) return child;
+        if (atomic.has(child.tagName)) return child;
+        if (child.tagName === 'UL' || child.tagName === 'OL') {
+          const items = [...child.children].filter((item) => item.tagName === 'LI');
+          // Do not split an ordered list and inadvertently reset its numbering.
+          if (items.length <= 4 && (child.textContent || '').length <= 360) return child;
+          return null;
+        }
+        if (structural.has(child.tagName)) {
+          const nested = firstUnit(child);
+          if (nested) return nested;
+          return null;
+        }
+        return child;
+      }
+      return null;
+    }
+
+    function takeUnit(target) {
+      const parents = [];
+      let current = target.parentNode;
+      while (current && current !== root) {
+        parents.push(current);
+        current = current.parentNode;
+      }
+      let moved = target;
+      for (const parent of parents) {
+        const shell = parent.cloneNode(false);
+        shell.appendChild(moved);
+        moved = shell;
+      }
+      front.appendChild(moved);
+      // Remove emptied provider wrappers left behind, preserving later content.
+      for (const parent of parents) {
+        if (parent.parentNode && ![...parent.childNodes].some(visible)) parent.remove();
+      }
+    }
+
+    for (let i = 0; i < 2; i += 1) {
+      const target = firstUnit(root);
+      if (!target) break;
+      takeUnit(target);
+      const enoughText = (front.textContent || '').trim().length >= 56;
+      const includesMedia = Boolean(front.querySelector('img, svg, math, pre'));
+      if (enoughText || includesMedia) break;
+    }
+    if (!front.hasChildNodes()) return { lead: '', rest: html };
+    return { lead: front.innerHTML, rest: root.innerHTML };
+  }
+
   function buildPrintableDocument(messages, title, options, totalImageCount, platform, sourceTypography = null) {
     const exportedAt = new Intl.DateTimeFormat(undefined, {
       dateStyle: "medium",
@@ -4512,13 +5029,14 @@
         const numberHtml = showMessageNumbers
           ? `<span class="message-number">${escapeHtml(t.message)} ${messageNumber}</span>`
           : "";
+        const opening = splitPrintableMessageOpening(message.html);
+        const metaHtml = `<div class="message-meta"><span class="role-badge">${escapeHtml(label)}</span>${numberHtml}</div>`;
         return `
           <section class="message ${escapeHtml(message.role)}${shortClass}${mediaClass}">
-            <div class="message-meta">
-              <span class="role-badge">${escapeHtml(label)}</span>
-              ${numberHtml}
-            </div>
-            <div class="message-body" dir="auto">${message.html}</div>
+            ${opening.lead
+              ? `<div class="message-opening">${metaHtml}<div class="message-body message-lead" dir="auto">${opening.lead}</div></div>
+                 <div class="message-body message-continuation" dir="auto">${opening.rest}</div>`
+              : `${metaHtml}<div class="message-body" dir="auto">${message.html}</div>`}
           </section>
         `;
       }).join("\n");
@@ -4554,6 +5072,23 @@
     @page {
       size: A4;
       margin: 15mm 14mm 16mm;
+      /* Chromium's four default margin boxes add browser date/title/URL/page
+         even when the conversation itself has no header/footer. Supplying
+         empty author-defined boxes suppresses those print artifacts without
+         touching PDF text or needing additional extension permissions. */
+      @top-left { content: ""; }
+      @top-right { content: ""; }
+      @bottom-left { content: ""; }
+      @bottom-right { content: ""; }
+      @bottom-center {
+        content: counter(page) " / " counter(pages);
+        font-family: Arial, sans-serif;
+        direction: ltr;
+        unicode-bidi: isolate;
+        font-size: 8pt;
+        font-weight: 400;
+        color: #8a929a;
+      }
     }
 
     * { box-sizing: border-box; }
@@ -4669,8 +5204,8 @@
     .export-time { color: var(--muted); align-self: center; margin-inline-start: 3px; }
 
     .exchange {
-      margin: 0 0 ${layoutMode === "compact" ? "11px" : "16px"};
-      padding: 0 0 ${layoutMode === "compact" ? "8px" : "12px"};
+      margin: 0 0 ${layoutMode === "compact" ? "8px" : "12px"};
+      padding: 0 0 ${layoutMode === "compact" ? "6px" : "8px"};
       border-bottom: 1px solid var(--line-soft);
     }
 
@@ -4692,10 +5227,20 @@
 
     .message {
       position: relative;
-      margin: 0 0 ${layoutMode === "compact" ? "7px" : "10px"};
+      margin: 0 0 ${layoutMode === "compact" ? "6px" : "8px"};
       break-inside: auto;
       direction: ${documentDir};
     }
+
+    /* Group just the first content fragment with the author badge. */
+    .message-opening {
+      break-inside: avoid-page;
+      page-break-inside: avoid;
+    }
+    .message-opening .message-meta { break-after: avoid-page; }
+    .message-lead > :first-child { margin-top: 0 !important; }
+    .message-lead > :last-child { margin-bottom: 0 !important; }
+    .message-continuation:empty { display: none; }
 
     .message:last-child { margin-bottom: 0; }
 
@@ -4722,6 +5267,7 @@
       min-height: 20px;
       margin-bottom: ${layoutMode === "compact" ? "4px" : "6px"};
       break-after: avoid-page;
+      page-break-after: avoid;
       direction: ${documentDir};
     }
 
@@ -4801,9 +5347,28 @@
     .message-body > :first-child {
       margin-top: 0 !important;
       break-before: avoid-page;
+      page-break-before: avoid;
+    }
+    /* A role label must stay attached to the first authored sentence even
+       when the answer is wrapped in a provider DIV hierarchy. */
+    .message:not(.message-short) .message-body > :first-child > :first-child {
+      break-before: avoid-page;
     }
     .message-body > :last-child { margin-bottom: 0 !important; }
     .message-body [class] { max-width: 100%; }
+
+    /* Neutral structural wrappers: no provider utility class, CSS grid/card
+       viewport dimensions or source-page responsive min-height should survive. */
+    .message-body :is(div, section, article, figure, picture) {
+      min-height: 0 !important;
+      height: auto !important;
+      max-height: none !important;
+      aspect-ratio: auto !important;
+    }
+    .message-body :is(div, section, article) {
+      break-inside: auto;
+      page-break-inside: auto;
+    }
 
     p, ul, ol, blockquote, pre, table, figure {
       margin-top: ${layoutMode === "compact" ? "0.48em" : "0.62em"};
@@ -4884,8 +5449,20 @@
       table-layout: auto;
     }
 
-    thead { display: table-header-group; }
-    tr { break-inside: avoid; }
+    thead { display: table-header-group !important; }
+    tbody { display: table-row-group !important; }
+    table.export-table-short {
+      break-inside: avoid-page !important;
+      page-break-inside: avoid !important;
+    }
+    table.export-table-long {
+      break-inside: auto !important;
+      page-break-inside: auto !important;
+    }
+    thead tr, tbody tr {
+      break-inside: avoid-page;
+      page-break-inside: avoid;
+    }
 
     th, td {
       border: 1px solid #d2d6da;
@@ -4918,12 +5495,26 @@
     img.export-user-media,
     img.export-content-image {
       display: block;
-      width: auto !important;
-      max-width: 100% !important;
-      max-height: 178mm !important;
-      margin: 9px auto;
+      width: var(--chatfolio-image-width, auto) !important;
+      height: auto !important;
+      max-width: min(100%, 155mm) !important;
+      max-height: 150mm !important;
+      margin: 7px auto;
+      object-fit: contain;
       border-radius: 6px;
       break-inside: avoid;
+    }
+
+    /* A generated picture/product image should NOT be printed page-wide.
+       Wide screenshots still need enough width to keep small UI text legible. */
+    img.export-content-image {
+      max-width: min(100%, 112mm) !important;
+      max-height: 108mm !important;
+    }
+
+    img.export-content-image.export-response-screenshot {
+      max-width: min(100%, 155mm) !important;
+      max-height: 130mm !important;
     }
 
     img.export-user-media {
@@ -4941,6 +5532,53 @@
       white-space: pre-wrap;
       overflow-wrap: anywhere;
       unicode-bidi: plaintext;
+    }
+
+    /* Flatten source-card wrappers without removing citations, link targets,
+       hostnames, or icons. Browsers can now place several references on the
+       same line instead of giving each favicon an entire block of whitespace. */
+    .message-body .export-source-chip {
+      display: inline-flex !important;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 3px 5px;
+      max-width: 100%;
+      width: auto !important;
+      margin: 2px 5px 2px 0 !important;
+      padding: 2px 6px !important;
+      background: #f8faf9;
+      border: 1px solid #e5eae7;
+      border-radius: 7px;
+      font-size: 8.2pt;
+      line-height: 1.27;
+      break-inside: avoid-page;
+      vertical-align: middle;
+    }
+    .message-body .export-source-chip :is(div, span) {
+      display: inline !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      min-height: 0 !important;
+    }
+    .message-body .export-source-chip :is(p, figure) {
+      margin: 0 !important;
+      padding: 0 !important;
+    }
+    .message-body .export-source-chip .export-source-extra-count,
+    .message-body .export-source-ref .export-source-extra-count {
+      display: inline !important;
+      padding-inline-start: 5px !important;
+      margin-inline-start: 4px !important;
+      border-inline-start: 1px solid #d5dad8;
+      unicode-bidi: isolate;
+      white-space: nowrap;
+      color: #68727c;
+    }
+    .message-body .export-source-chip img.export-preview-logo {
+      width: 14px !important;
+      height: 14px !important;
+      max-height: 14px !important;
+      max-width: 14px !important;
     }
 
     .export-source-ref {
@@ -5031,7 +5669,14 @@
 
     figure {
       max-width: 100%;
-      break-inside: avoid;
+      break-inside: auto;
+    }
+
+    /* A figure may be a long product/result card, not just one illustration.
+       Keep the media intact, but let descriptive text flow onto the next page. */
+    figure > img, figure > picture {
+      break-inside: avoid-page;
+      page-break-inside: avoid;
     }
 
     figcaption {
@@ -5246,10 +5891,10 @@
 
   function scopePrintableCssForShadow(css) {
     let scoped = String(css || "");
-    // The generated stylesheet was originally authored for a standalone HTML
-    // document. In live-page mode it is mounted in a ShadowRoot, so remap only
-    // the document-level selectors while leaving all message selectors intact.
-    scoped = scoped.replace(/:root\s*\{/g, ":host {");
+    // Live-page printing uses ordinary light-DOM markup so provider-loaded
+    // RTL fonts remain available. Map root-level variables to our print document
+    // instead of :host (which is only valid inside a ShadowRoot).
+    scoped = scoped.replace(/:root\s*\{/g, ".chatfolio-live-document {");
     scoped = scoped.replace(/html\[dir="rtl"\]/g, ".chatfolio-live-document[dir=\"rtl\"]");
     scoped = scoped.replace(/html\[data-script="arabic"\]/g, ".chatfolio-live-document[data-script=\"arabic\"]");
     scoped = scoped.replace(/html\[data-script="hebrew"\]/g, ".chatfolio-live-document[data-script=\"hebrew\"]");
