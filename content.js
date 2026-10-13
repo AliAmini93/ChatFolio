@@ -2640,6 +2640,7 @@
       const key = meta.strongKey ? meta.strongKey : `${meta.fingerprintKey}:occ:${occurrence}`;
 
       const serialized = await serializeTurn(turn, messageNode, role, options.embedImages, signal);
+      assertProviderUserImagesCaptured(serialized, role, options.embedImages);
       imageCount += serialized.imageCount;
       for (const mediaKey of serialized.mediaKeys) processedMediaKeys.add(mediaKey);
       messages.push({
@@ -2765,6 +2766,7 @@
         }
 
         const serialized = await serializeTurn(turn, messageNode, role, options.embedImages, signal);
+        assertProviderUserImagesCaptured(serialized, role, options.embedImages);
         throwIfCancelled(session);
         assertSameConversation(session);
         imageCount += serialized.imageCount;
@@ -3354,6 +3356,15 @@
     }
   }
 
+  function assertProviderUserImagesCaptured(serialized, role, embedImages) {
+    if (PLATFORM.id === 'chatgpt' || role !== 'user' || !embedImages) return;
+    const count = Number(serialized?.missingUserImages || 0);
+    if (count > 0) {
+      throw new Error(`${PLATFORM.name}: ${count} uploaded user image(s) could not be embedded. ` +
+        'Export stopped to avoid an incomplete PDF. Make sure the attachments are visible on the conversation page, retry, or choose Visual backup manually.');
+    }
+  }
+
   async function serializeTurn(turn, messageNode, role, embedImages, signal) {
     if (signal?.aborted) throw makeCancelledError();
     const source = turn || messageNode;
@@ -3376,6 +3387,7 @@
 
     let embeddedImageCount = 0;
     let meaningfulImageCount = 0;
+    let missingUserImages = 0;
     const mediaKeys = [];
 
     // Convert canvas output to ordinary images before pruning the clone.
@@ -3393,7 +3405,8 @@
         embeddedImageCount += 1;
         meaningfulImageCount += 1;
       } catch {
-        cloneCanvases[i].remove();
+        if (role === 'user') missingUserImages += 1;
+        cloneCanvases[i].replaceWith(makeMissingImageNotice());
       }
     }
 
@@ -3421,7 +3434,7 @@
       if (i % 4 === 0) await sleepWithAbort(0, signal);
       const { sourceImg, cloneImg } = imagePairs[i];
       if (!clone.contains(cloneImg)) continue;
-      const src = sourceImg.currentSrc || sourceImg.src || sourceImg.getAttribute("src") || "";
+      const src = bestLiveImageUrl(sourceImg);
       const mediaKey = src || sourceImg.getAttribute("alt") || `image-${i}`;
       mediaKeys.push(mediaKey);
 
@@ -3450,20 +3463,35 @@
         (ratio >= 1.42 || /(?:screenshot|screen\s*shot|capture)/i.test(sourceImg.alt || ''))) {
         cloneImg.classList.add('export-response-screenshot');
       }
-      if (imageKind !== "export-preview-logo") meaningfulImageCount += 1;
+      // Count actual picture content, not merely a placeholder or broken icon.
+      const isUserImage = role === 'user' && imageKind === 'export-user-media';
+      const liveImageLooksReal = Number(sourceImg.naturalWidth || 0) >= 24 && Number(sourceImg.naturalHeight || 0) >= 24;
+      if (imageKind !== "export-preview-logo" && (!isUserImage || liveImageLooksReal)) meaningfulImageCount += 1;
 
       cloneImg.removeAttribute("srcset");
       cloneImg.removeAttribute("sizes");
       cloneImg.setAttribute("loading", "eager");
       cloneImg.setAttribute("decoding", "sync");
 
-      if (!src) continue;
+      if (!src && !isUserImage) continue;
 
       if (embedImages) {
-        const embedded = await sourceToDataUrl(src, signal);
-        cloneImg.src = embedded || absoluteUrl(src) || src;
-        if (embedded) embeddedImageCount += 1;
-      } else {
+        const embedded = PLATFORM.id === 'chatgpt'
+          ? await sourceToDataUrl(src, signal)
+          : await embedVisibleProviderImage(sourceImg, src, signal);
+        if (embedded) {
+          cloneImg.src = embedded;
+          embeddedImageCount += 1;
+          if (isUserImage && !liveImageLooksReal) meaningfulImageCount += 1;
+        } else if (isUserImage) {
+          // A broken <img> cannot masquerade as a successful archived attachment.
+          // The full-conversation serializer reports an explicit warning instead.
+          missingUserImages += 1;
+          cloneImg.replaceWith(makeMissingImageNotice());
+        } else if (src) {
+          cloneImg.src = absoluteUrl(src) || src;
+        }
+      } else if (src) {
         cloneImg.src = absoluteUrl(src) || src;
       }
     }
@@ -3504,6 +3532,16 @@
     // not authored conversation content.
     clone.querySelectorAll("[data-message-action-bar], [role='toolbar'], [data-testid='action-bar-copy'], .sr-only, .cdk-visually-hidden").forEach((node) => node.remove());
     cleanupProviderArtifacts(clone, role, source);
+
+    // Both Claude and Gemini sometimes mount the uploaded-image thumbnail beside
+    // the authored user text rather than inside it. These sibling images must be
+    // captured from the user's OWN turn, never the assistant reply or toolbar.
+    if (role === 'user' && (PLATFORM.id === 'claude' || PLATFORM.id === 'gemini')) {
+      const extra = await appendProviderUserImages(source, messageNode, clone, embedImages, signal, mediaKeys);
+      meaningfulImageCount += extra.count;
+      embeddedImageCount += extra.embedded;
+      missingUserImages += extra.missing;
+    }
 
     const allCloneNodes = [...clone.querySelectorAll("*")];
     for (let i = 0; i < allCloneNodes.length; i += 1) {
@@ -3555,6 +3593,7 @@
       text: plainText,
       imageCount: meaningfulImageCount,
       embeddedImageCount,
+      missingUserImages,
       mediaKeys
     };
     validateSerializedAssistant(serialized, role);
@@ -4095,6 +4134,232 @@
       const value = normalizeText(textNode.nodeValue || "").toLowerCase();
       if (value.length <= 24 && unwanted.has(value)) textNode.nodeValue = "";
     }
+  }
+
+  // Live provider image URLs can be stored in currentSrc, lazy-loading attributes,
+  // srcset or a thumbnail background. Resolve them before cloning/provider cleanup.
+  function bestLiveImageUrl(element) {
+    if (!element) return '';
+    const direct = [
+      element.currentSrc, element.getAttribute?.('src'),
+      element.getAttribute?.('data-src'), element.getAttribute?.('data-original'),
+      element.getAttribute?.('data-image-url'), element.getAttribute?.('data-full-src')
+    ].filter(Boolean);
+    const srcset = element.getAttribute?.('srcset') || '';
+    if (srcset) {
+      const parts = srcset.split(',').map((part) => part.trim().split(/\s+/)[0]);
+      direct.push(...parts.reverse());
+    }
+    const imageUrl = direct.find((url) => /^(?:https?:|blob:|data:image\/|\/)/i.test(String(url || '').trim()));
+    if (imageUrl) return absoluteUrl(imageUrl) || imageUrl;
+
+    try {
+      const style = getComputedStyle(element);
+      const value = style?.backgroundImage || '';
+      const match = value.match(/url\(\s*(["']?)(.*?)\1\s*\)/i);
+      if (match?.[2]) return absoluteUrl(match[2]) || match[2];
+    } catch {}
+    return '';
+  }
+
+  function plausibleLiveUserPicture(element) {
+    if (!element?.getBoundingClientRect) return false;
+    const rect = element.getBoundingClientRect();
+    const naturalWidth = Number(element.naturalWidth || 0);
+    const naturalHeight = Number(element.naturalHeight || 0);
+    const displayed = rect.width >= 68 && rect.height >= 48;
+    const largeAsset = naturalWidth >= 128 && naturalHeight >= 80 && rect.width >= 35 && rect.height >= 35;
+    if (!displayed && !largeAsset) return false;
+    if (element.closest?.('model-response, .model-response, .model-response-container, [data-message-author-role="assistant"], [data-testid*="toolbar"], nav, aside')) return false;
+    return true;
+  }
+
+  function liveImageInViewport(element) {
+    const rect = element?.getBoundingClientRect?.();
+    if (!rect) return false;
+    const viewportWidth = Math.max(1, window.innerWidth);
+    const viewportHeight = Math.max(1, window.innerHeight);
+    return rect.width >= 24 && rect.height >= 24 &&
+      rect.left >= -1 && rect.top >= -1 &&
+      rect.right <= viewportWidth + 1 && rect.bottom <= viewportHeight + 1;
+  }
+
+  function saveImageScrollPositions(element) {
+    // scrollIntoView() can move multiple nested scrollers and the document. Keep
+    // every original offset so image capture never leaves the chat repositioned.
+    const positions = [];
+    const seen = new Set();
+    const remember = (node) => {
+      if (!node || seen.has(node) || typeof node.scrollTop !== 'number') return;
+      seen.add(node);
+      positions.push({ node, top: node.scrollTop, left: node.scrollLeft });
+    };
+    remember(document.scrollingElement);
+    for (let node = element; node; node = node.parentElement) remember(node);
+    return { positions, x: window.scrollX, y: window.scrollY };
+  }
+
+  function restoreImageScrollPositions(snapshot) {
+    if (!snapshot) return;
+    // Restore descendant scrollers before their outer parents.
+    for (const { node, top, left } of [...snapshot.positions].reverse()) {
+      try { node.scrollTop = top; node.scrollLeft = left; } catch {}
+    }
+    try { window.scrollTo(snapshot.x, snapshot.y); } catch {}
+  }
+
+  async function waitForLiveUserImage(element, signal) {
+    // Gemini may lazy-load an uploaded picture only after it comes into view.
+    if (element.tagName !== 'IMG' || (element.complete && element.naturalWidth >= 24)) return;
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      if (signal?.aborted) throw makeCancelledError();
+      if (element.complete && element.naturalWidth >= 24) break;
+      await sleepWithAbort(140, signal);
+    }
+  }
+
+  async function captureVisibleImageRegion(element, signal) {
+    // Chrome can render a Google/Claude-hosted image while preventing scripts
+    // and even an extension-origin fetch from reading its bytes (CORS/redirect).
+    // Capture ONLY its own rectangle from the authenticated source tab. Gemini's
+    // history loader often parks at the top, so later uploads are off-screen:
+    // bring the image into view temporarily, then restore all scroll offsets.
+    if (!element?.getBoundingClientRect || !plausibleLiveUserPicture(element)) return '';
+    if (signal?.aborted) throw makeCancelledError();
+    const wasVisible = liveImageInViewport(element);
+    const scrollSnapshot = wasVisible ? null : saveImageScrollPositions(element);
+    try {
+      if (!wasVisible) {
+        element.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'nearest' });
+        await sleepWithAbort(190, signal);
+      }
+      await waitForLiveUserImage(element, signal);
+      // Never archive the broken-image glyph as a valid user attachment.
+      if (element.tagName === 'IMG' && Number(element.naturalWidth || 0) < 24) return '';
+      if (!liveImageInViewport(element)) return '';
+      const rect = element.getBoundingClientRect();
+      const vw = Math.max(1, window.innerWidth);
+      const vh = Math.max(1, window.innerHeight);
+      const response = await sendRuntimeMessage({ type: 'CHATFOLIO_CAPTURE_VISIBLE', quality: 88 });
+      if (!response?.ok || !response?.dataUrl) return '';
+      const screenshot = await loadDataUrlImage(response.dataUrl, signal);
+      const sx = Math.max(0, Math.round(rect.left * screenshot.naturalWidth / vw));
+      const sy = Math.max(0, Math.round(rect.top * screenshot.naturalHeight / vh));
+      const sw = Math.max(1, Math.min(screenshot.naturalWidth - sx, Math.round(rect.width * screenshot.naturalWidth / vw)));
+      const sh = Math.max(1, Math.min(screenshot.naturalHeight - sy, Math.round(rect.height * screenshot.naturalHeight / vh)));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.min(1800, sw);
+      canvas.height = Math.max(1, Math.round(sh * canvas.width / sw));
+      const context = canvas.getContext('2d', { alpha: false });
+      if (!context) return '';
+      context.fillStyle = '#fff';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(screenshot, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+      return canvas.toDataURL('image/jpeg', 0.9);
+    } catch (error) {
+      if (signal?.aborted) throw makeCancelledError();
+      return '';
+    } finally {
+      restoreImageScrollPositions(scrollSnapshot);
+    }
+  }
+
+  async function embedVisibleProviderImage(element, rawUrl, signal) {
+    const url = rawUrl || bestLiveImageUrl(element);
+    // Googleusercontent images often redirect to authenticated rd-gg hosts. The
+    // web page may display them while a second fetch from chrome-extension://
+    // is blocked by CORS. Prefer the rendered photo rather than triggering
+    // another doomed fetch. If capture fails, retain the older fetch paths.
+    const geminiProtectedImage = PLATFORM.id === 'gemini' &&
+      /^https:\/\/(?:[a-z0-9-]+\.)*googleusercontent\.com\//i.test(url);
+    if (geminiProtectedImage) {
+      const rendered = await captureVisibleImageRegion(element, signal);
+      if (rendered) return rendered;
+    }
+    if (url) {
+      const local = await sourceToDataUrl(url, signal);
+      if (local && /^data:image\//i.test(local)) return local;
+      if (/^https:\/\//i.test(url)) {
+        try {
+          const remote = await sendRuntimeMessage({ type: 'CHATFOLIO_FETCH_DATA_RESOURCE', url });
+          if (remote?.ok && /^data:image\//i.test(remote.dataUrl || '')) return remote.dataUrl;
+        } catch {}
+      }
+    }
+    return geminiProtectedImage ? '' : await captureVisibleImageRegion(element, signal);
+  }
+
+  function makeMissingImageNotice() {
+    const box = document.createElement('div');
+    box.className = 'export-attachment export-image-unavailable';
+    box.textContent = 'Image attachment could not be embedded. Reopen this conversation and retry with the image visible.';
+    return box;
+  }
+
+  function providerUserMediaContainer(source, messageNode) {
+    if (PLATFORM.id === 'claude') {
+      return messageNode?.closest?.('[data-test-render-count]')
+        || source?.closest?.('[data-test-render-count]')
+        || messageNode?.parentElement?.parentElement || null;
+    }
+    if (PLATFORM.id === 'gemini') {
+      return messageNode?.closest?.('.conversation-container')
+        || source?.closest?.('.conversation-container')
+        || messageNode?.parentElement || null;
+    }
+    return null;
+  }
+
+  async function appendProviderUserImages(source, messageNode, clone, embedImages, signal, mediaKeys) {
+    const container = providerUserMediaContainer(source, messageNode);
+    if (!container) return { count: 0, embedded: 0, missing: 0 };
+    let count = 0;
+    let embedded = 0;
+    let missing = 0;
+    const seen = new Set((mediaKeys || []).filter((key) => /^(?:https?:|blob:|data:image\/)/i.test(key)));
+    const candidates = [
+      ...container.querySelectorAll('img, canvas, [style*="background-image"], [data-testid*="image-preview"], [data-test-id*="image-preview"]')
+    ];
+    for (const element of candidates) {
+      if (count >= 10) break;
+      if (source?.contains?.(element) || messageNode?.contains?.(element)) continue;
+      if (!plausibleLiveUserPicture(element)) continue;
+      if (element.closest?.('[data-test-render-count]') && PLATFORM.id === 'claude'
+        && element.closest('[data-test-render-count]') !== container) continue;
+      const url = bestLiveImageUrl(element);
+      const key = url || `attachment:${Math.round(element.getBoundingClientRect().left)}:${Math.round(element.getBoundingClientRect().top)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      let imageSrc = '';
+      if (element.tagName === 'CANVAS') {
+        try { imageSrc = element.toDataURL('image/png'); } catch {}
+        if (!imageSrc) imageSrc = await captureVisibleImageRegion(element, signal);
+      } else {
+        imageSrc = embedImages ? await embedVisibleProviderImage(element, url, signal) : url;
+      }
+      if (!imageSrc) {
+        missing += 1;
+        clone.appendChild(makeMissingImageNotice());
+        continue;
+      }
+      const figure = document.createElement('figure');
+      figure.className = 'export-media-wrapper export-user-attachment';
+      const image = document.createElement('img');
+      image.src = imageSrc;
+      image.alt = 'Uploaded image';
+      image.className = 'export-user-media';
+      image.setAttribute('data-export-image-kind', 'export-user-media');
+      image.setAttribute('loading', 'eager');
+      image.setAttribute('decoding', 'sync');
+      const width = Math.round(element.getBoundingClientRect().width);
+      if (width >= 32 && width <= 2400) image.style.setProperty('--chatfolio-image-width', `${width}px`);
+      figure.appendChild(image);
+      clone.appendChild(figure);
+      count += 1;
+      if (embedImages) embedded += 1;
+      mediaKeys?.push(key);
+    }
+    return { count, embedded, missing };
   }
 
   function classifyImage(sourceImg, role) {
@@ -4959,8 +5224,15 @@
       const includesMedia = Boolean(front.querySelector('img, svg, math, pre'));
       if (enoughText || includesMedia) break;
     }
-    if (!front.hasChildNodes()) return { lead: '', rest: html };
-    return { lead: front.innerHTML, rest: root.innerHTML };
+    if (!front.hasChildNodes()) return { lead: '', rest: html, longTextOpening: false };
+    // A single Gemini <p> (or text-only DIV) can contain an entire long reply.
+    // Keeping that fragment indivisible pushes the whole reply to the next
+    // page, leaving half an A4 sheet blank. Text-only long opening fragments
+    // may split while the author label remains paired with the first lines.
+    const leadTextLength = (front.textContent || '').replace(/\s+/g, ' ').trim().length;
+    const longTextOpening = leadTextLength > 520 &&
+      !front.querySelector('img, picture, svg, canvas, video, math, table, pre');
+    return { lead: front.innerHTML, rest: root.innerHTML, longTextOpening };
   }
 
   function buildPrintableDocument(messages, title, options, totalImageCount, platform, sourceTypography = null) {
@@ -5030,11 +5302,15 @@
           ? `<span class="message-number">${escapeHtml(t.message)} ${messageNumber}</span>`
           : "";
         const opening = splitPrintableMessageOpening(message.html);
+        // Gemini can render a very long answer as one paragraph. Only for
+        // text-only long openings let Chromium paginate within that fragment.
+        const openingFlowClass = platform?.id === 'gemini' && opening.longTextOpening
+          ? ' message-opening-flow' : '';
         const metaHtml = `<div class="message-meta"><span class="role-badge">${escapeHtml(label)}</span>${numberHtml}</div>`;
         return `
           <section class="message ${escapeHtml(message.role)}${shortClass}${mediaClass}">
             ${opening.lead
-              ? `<div class="message-opening">${metaHtml}<div class="message-body message-lead" dir="auto">${opening.lead}</div></div>
+              ? `<div class="message-opening${openingFlowClass}">${metaHtml}<div class="message-body message-lead" dir="auto">${opening.lead}</div></div>
                  <div class="message-body message-continuation" dir="auto">${opening.rest}</div>`
               : `${metaHtml}<div class="message-body" dir="auto">${message.html}</div>`}
           </section>
@@ -5236,6 +5512,13 @@
     .message-opening {
       break-inside: avoid-page;
       page-break-inside: avoid;
+    }
+    /* Long Gemini opening paragraphs need to fragment rather than forcing the
+       *entire* answer onto the next page. All ordinary badge/opening pairs,
+       especially those with images, retain their no-break protection. */
+    .message-opening.message-opening-flow {
+      break-inside: auto;
+      page-break-inside: auto;
     }
     .message-opening .message-meta { break-after: avoid-page; }
     .message-lead > :first-child { margin-top: 0 !important; }
@@ -5519,6 +5802,14 @@
 
     img.export-user-media {
       border: 1px solid #e1e4e7;
+    }
+
+    .export-image-unavailable {
+      border: 1px solid #d5a585;
+      background: #fffaf6;
+      font-size: 10px;
+      padding: 8px;
+      margin: 7px 0;
     }
 
     .export-media-wrapper {

@@ -1,4 +1,29 @@
-## v1.8.8 - Pagination and citation polish (pre-release candidate)
+## v1.8.11 - Gemini pagination and cross-provider image support (2026-10-13)
+
+- Prevent excessive blank A4 space when Gemini's first answer fragment is a long paragraph.
+- Relax keep-together for long text-only Gemini message openings; preserve badge pairing, media integrity, and all previous extraction code.
+- Add PDF regression tests for overflowing opening blocks, image safety and unchanged Claude/ChatGPT.
+- Confirmed on a real Gemini export: all 8 turns, visible user-uploaded screenshot and long answer starting on page one; Claude user-uploaded screenshot and ChatGPT full-chat cases verified in earlier live tests.
+
+## v1.8.10 - Gemini off-screen protected upload capture (test build)
+
+- Fix image capture after Gemini's full-history scan scrolls a later user-uploaded image outside the visible viewport.
+- Temporarily scroll the uploaded image into view for a pixel-accurate screenshot crop, wait for lazy loading, and restore nested/document scroll positions even after errors.
+- Prefer capture for protected Googleusercontent URLs to avoid failing extension-origin CORS redirects while preserving source-data fallbacks.
+- Existing Claude images, ChatGPT extraction and PDF printing remain unchanged.
+- Synthetic tests: offscreen nested + sibling Gemini images, restored scroll, correct pixels, no blocked direct fetch, plus prior image/print/scanner regressions.
+- Await live verification on the user's Gemini chat before release.
+
+## v1.8.9 - Claude and Gemini attachment image capture (test build)
+
+- Capture user-uploaded images located outside authored text wrappers in Claude and Gemini, including picture buttons, CSS-background previews and canvas snapshots.
+- Embed images in the PDF using page fetch, authorized provider-image extension fetch, or a tight visible-tab crop for a displayed attachment when browser CORS/auth rules prevent reuse of its original URL.
+- Prevent a broken thumbnail from silently appearing as a successfully exported image. Explicitly stop semantic export when an identified user image cannot be embedded.
+- Keep all ChatGPT scanning, scrolling, Stop, existing pagination and visual-backup behavior intact.
+- Synthetic Chromium tests include Claude/Gemini images in and next to user turns, a blocked-fetch screenshot fallback and a generated PDF with verified embedded image pixels.
+- Requires real-world validation against the user's logged-in Claude and Gemini UI. GitHub v1.8.8 remains the current published pre-release pending this test.
+
+## v1.8.8 - Pagination and citation polish (test build)
 
 - Keep the message label with its first actual content fragment, even when provider DOM adds nested wrappers. Long responses still paginate normally.
 - Add unobtrusive `current / total` page numbers in CSS page margin boxes, without allowing default Chrome headers/footers to return.

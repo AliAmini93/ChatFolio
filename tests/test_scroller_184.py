@@ -1,7 +1,7 @@
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import time,json
-ROOT=Path('/mnt/data/chatfolio_workspace/chatfolio-1.8.5')
+ROOT=Path(__file__).resolve().parents[1]
 source=(ROOT/'content.js').read_text()
 source=source.replace('const PLATFORM = detectPlatform();','const PLATFORM = { id: "chatgpt", name: "ChatGPT", assistantLabel: "ChatGPT" };',1)
 source=source.rsplit('})();',1)[0]+'''window.__cfTest={getMessageNodes,resolveConversationScrollContainer,collectEntireConversation,probeConversationScroller};})();'''
