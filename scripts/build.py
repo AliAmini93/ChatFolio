@@ -10,6 +10,7 @@ import hashlib
 import json
 from pathlib import Path
 import zipfile
+import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_FILES = (
@@ -34,6 +35,7 @@ def sha256(data: bytes) -> str:
 
 
 def build(destination: Path) -> dict[str, str]:
+    subprocess.run(["node", str(ROOT / "scripts/bundle.mjs"), "--check"], check=True)
     manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("manifest_version") != 3:
         raise ValueError("Expected a Chrome Manifest V3 extension")

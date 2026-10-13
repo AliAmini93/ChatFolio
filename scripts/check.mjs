@@ -26,6 +26,7 @@ for (const file of runtimeFiles) {
   console.log(`Syntax OK: ${file}`);
 }
 console.log(`Runtime integrity OK: manifest v${manifest.version}`);
+execFileSync(process.execPath, [join(root, 'scripts/bundle.mjs'), '--check'], { stdio: 'inherit' });
 
 // Phase-2 pure domain modules and unit tests are also syntax-checked.
 function collectModules(dir, suffix) {

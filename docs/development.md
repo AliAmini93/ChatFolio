@@ -61,3 +61,12 @@ content script. Run `npm run test:core` for fast contract checks. Local
 Linux environments with system Chromium rather than Playwright-managed Chromium
 can use `CHATFOLIO_CHROMIUM=/usr/bin/chromium npm test`. See ADR 0002 for
 compatibility and migration gates.
+
+## Generated provider DOM adapters
+
+The checked-in root `content.js` is generated from `src/content/main.js` and
+three `src/providers/*/dom-adapter.js` ESM factories by `scripts/bundle.mjs`.
+After changing these sources, run `npm run bundle && npm run check`.
+The generator refuses unexpected imports/exports. Test the emitted classic
+script with `CHATFOLIO_CHROMIUM=/usr/bin/chromium npm test` before committing.
+See ADR 0003 for the temporary bundler rationale.
