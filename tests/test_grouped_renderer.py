@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import json
@@ -22,7 +23,7 @@ markup=f'''<main>
 </div></div>
 </main>'''
 with sync_playwright() as p:
-    browser=p.chromium.launch(headless=True,executable_path='/usr/bin/chromium', args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu'], timeout=10000)
+    browser=p.chromium.launch(headless=True,executable_path=os.environ.get('CHATFOLIO_CHROMIUM') or None, args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu'], timeout=10000)
     page=browser.new_page()
     page.set_content(markup,wait_until='domcontentloaded',timeout=10000)
     page.evaluate('''window.chrome={runtime:{getManifest:()=>({version:"1.8.4"}),onMessage:{addListener:()=>{}},sendMessage:async()=>({})}}''')

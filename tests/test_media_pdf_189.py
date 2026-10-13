@@ -1,3 +1,5 @@
+import tempfile
+import os
 """Generate a synthetic Claude PDF and verify user attachment image is embedded."""
 from pathlib import Path
 import base64
@@ -13,9 +15,9 @@ source=source.rsplit('})();',1)[0]+'window.__cfPDF={serializeTurn,getMessageNode
 png=Image.new('RGB',(640,360),(63,120,190));buffer=io.BytesIO();png.save(buffer,format='PNG');url='data:image/png;base64,'+base64.b64encode(buffer.getvalue()).decode()
 html=f'''<div data-test-render-count="1"><div data-testid="user-message">Describe attached picture.</div><img alt="uploaded screenshot" src="{url}" style="width:350px;height:197px"></div>
 <div data-test-render-count="2"><div class="font-claude-response"><p>The picture is blue and 640 pixels wide.</p></div></div>'''
-pdf=Path('/mnt/data/chatfolio_189_work/user-upload-189-smoke.pdf')
+pdf=Path(tempfile.mkdtemp(prefix='chatfolio-pdf-')) / 'user-upload-189-smoke.pdf'
 with sync_playwright() as p:
- b=p.chromium.launch(headless=True,executable_path='/usr/bin/chromium',args=['--no-sandbox','--disable-dev-shm-usage'])
+ b=p.chromium.launch(headless=True,executable_path=os.environ.get('CHATFOLIO_CHROMIUM') or None,args=['--no-sandbox','--disable-dev-shm-usage'])
  page=b.new_page(); page.set_content(html,wait_until='load')
  page.evaluate('''window.chrome={runtime:{getManifest:()=>({version:'1.8.9'}),onMessage:{addListener:()=>{}},sendMessage:(x,cb)=>cb({ok:false})}}''')
  page.add_script_tag(content=source)

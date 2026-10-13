@@ -1,0 +1,11 @@
+# Local build outputs and test artifacts
+/dist/
+/.artifacts/
+/.venv/
+/node_modules/
+/__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+*.log

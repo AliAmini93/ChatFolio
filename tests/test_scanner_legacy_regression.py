@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import json,time
@@ -29,7 +30,7 @@ function renderVisible(){
 scroller.addEventListener('scroll',()=>renderVisible(),{passive:true});renderVisible();
 </script></body></html>'''
 with sync_playwright() as p:
-    browser=p.chromium.launch(headless=True,executable_path='/usr/bin/chromium',args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu'],timeout=15000)
+    browser=p.chromium.launch(headless=True,executable_path=os.environ.get('CHATFOLIO_CHROMIUM') or None,args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu'],timeout=15000)
     page=browser.new_page(viewport={'width':1250,'height':900})
     page.set_content(html,wait_until='domcontentloaded')
     page.evaluate('''window.chrome={runtime:{getManifest:()=>({version:"1.8.4"}),onMessage:{addListener:()=>{}},sendMessage:async()=>({})}}''')

@@ -1,3 +1,4 @@
+import os
 """Verify real off-screen Googleusercontent images are embedded by a viewport crop.
 This intentionally disallows any CORS fetch: image pixels may only be captured
 from the original Gemini page after temporary scrolling, then scroll restored.
@@ -16,7 +17,7 @@ png = buffer.getvalue()
 results = []
 
 with sync_playwright() as playwright:
-    browser = playwright.chromium.launch(headless=True, executable_path='/usr/bin/chromium', args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu'])
+    browser = playwright.chromium.launch(headless=True, executable_path=os.environ.get('CHATFOLIO_CHROMIUM') or None, args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu'])
     for sibling in [False, True]:
         page = browser.new_page(viewport={'width': 1100, 'height': 800}, device_scale_factor=1)
         page.route('https://lh3.googleusercontent.com/**', lambda route: route.fulfill(status=200, content_type='image/png', body=png))

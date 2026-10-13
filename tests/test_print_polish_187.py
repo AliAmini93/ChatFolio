@@ -37,7 +37,7 @@ content = f'''<!doctype html><html><body>
 </body></html>'''
 
 with sync_playwright() as p:
-    browser = p.chromium.launch(headless=True, executable_path='/usr/bin/chromium', args=['--no-sandbox','--disable-dev-shm-usage'])
+    browser = p.chromium.launch(headless=True, executable_path=os.environ.get('CHATFOLIO_CHROMIUM') or None, args=['--no-sandbox','--disable-dev-shm-usage'])
     page = browser.new_page(viewport={'width':1024,'height':850})
     page.set_content(content,wait_until='load')
     page.evaluate('''window.chrome={runtime:{getManifest:()=>({version:"1.8.7"}),onMessage:{addListener:()=>{}},sendMessage:async()=>({})}}''')

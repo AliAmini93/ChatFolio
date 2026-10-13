@@ -25,7 +25,7 @@ cases={
 }
 results=[]
 with sync_playwright() as p:
-    b=p.chromium.launch(headless=True,executable_path='/usr/bin/chromium',args=['--no-sandbox','--disable-dev-shm-usage'])
+    b=p.chromium.launch(headless=True,executable_path=os.environ.get('CHATFOLIO_CHROMIUM') or None,args=['--no-sandbox','--disable-dev-shm-usage'])
     pg=b.new_page(viewport={'width':1200,'height':920})
     pg.set_content('<html></html>')
     pg.evaluate('window.chrome={runtime:{getManifest:()=>({version:"1.8.11"}),onMessage:{addListener:()=>{}},sendMessage:async()=>({})}}')
