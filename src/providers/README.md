@@ -46,3 +46,12 @@ Run `npm run bundle`, then `npm run check` and `npm test` after modifications.
 Authenticated fetches and the remaining scanner/network orchestration are still
 in the main controller pending phase 3B2/3B3. Do not introduce network calls or
 persistent access-token storage into the parser module.
+
+## ChatGPT transport (Phase 3B2)
+
+`chatgpt/transport.js` receives `fetchImpl`, URL origin, account resolver and
+parsers as dependencies. Keep all ChatGPT session, conversation, public share,
+legacy share and asset-download requests inside this factory. The classic MV3
+content script receives the factory through the deterministic bundler; no
+module imports execute inside injected `content.js`. The caller retains Stop,
+progress, DOM scanning and rendering. See ADR 0003B2.
