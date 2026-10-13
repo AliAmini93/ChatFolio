@@ -53,3 +53,11 @@ The legacy `content.js` is still a single script. ESLint/Prettier, TypeScript,
 and esbuild will be introduced with reviewed module-by-module refactoring,
 rather than applying destructive automatic formatting to the entire legacy
 codebase before the behavior baseline is secured.
+
+## Phase-2 pure domain contracts
+
+Contract models are introduced in `src/core` without changing the shipped
+content script. Run `npm run test:core` for fast contract checks. Local
+Linux environments with system Chromium rather than Playwright-managed Chromium
+can use `CHATFOLIO_CHROMIUM=/usr/bin/chromium npm test`. See ADR 0002 for
+compatibility and migration gates.
