@@ -190,384 +190,404 @@
     return { id: "unsupported", name: "Unsupported", assistantLabel: "Assistant" };
   }
 
+  // BEGIN GENERATED chatgpt provider adapter
+  /** ChatGPT DOM extraction adapter. No transport, media, or printing side effects. */
+  function createChatGPTDomAdapter(context) {
+    const { outsideUiChrome, sortInDocumentOrder, normalizeText, looksUniqueDomId, cleanTitle, lastMessageNearViewportEnd } = context;
+    const roleSelector = [
+      '[data-message-author-role="user"]',
+      '[data-message-author-role="assistant"]',
+      '[data-role="user"]',
+      '[data-role="assistant"]',
+      '[data-message-author="user"]',
+      '[data-message-author="assistant"]'
+    ].join(', ');
+
+    const legacyTurnSelector = [
+      'section[data-turn="user"]',
+      'section[data-turn="assistant"]',
+      'article[data-turn="user"]',
+      'article[data-turn="assistant"]',
+      '[data-testid^="conversation-turn-"]',
+      '[data-testid*="conversation-turn"]',
+      '.user-turn',
+      '.agent-turn'
+    ].join(', ');
+
+    // ChatGPT's 2026 grouped renderer puts a user prompt and its assistant
+    // response under the same stable [data-turn-key] group. The old role/data-turn
+    // attributes can be completely absent in this rollout, so collect the two
+    // authored surfaces separately instead of treating the whole group as one turn.
+    const groupedTurnSelector = '[data-turn-key]';
+    const groupedUserSelector = '[data-user-message-bubble]';
+    const groupedAssistantSelector = '[data-conversation-role="assistant"]';
+    const groupedAssistantStartSelector = '[data-chatgpt-agent-turn-start]';
+
+    function inferRole(node) {
+      if (!node) return "unknown";
+
+      const direct = node.getAttribute?.('data-message-author-role')
+        || node.getAttribute?.('data-role')
+        || node.getAttribute?.('data-message-author')
+        || node.getAttribute?.('data-turn')
+        || node.getAttribute?.('data-conversation-role');
+      if (direct === 'user' || direct === 'assistant') return direct;
+
+      if (node.matches?.(groupedUserSelector) || node.closest?.(groupedUserSelector)) return 'user';
+      if (node.matches?.(groupedAssistantSelector) || node.closest?.(groupedAssistantSelector)) return 'assistant';
+      if (node.matches?.(groupedAssistantStartSelector) || node.closest?.(groupedAssistantStartSelector)) return 'assistant';
+      const nestedGroupedUser = Boolean(node.querySelector?.(groupedUserSelector));
+      const nestedGroupedAssistant = Boolean(node.querySelector?.(`${groupedAssistantSelector}, ${groupedAssistantStartSelector}`));
+      if (nestedGroupedAssistant && !nestedGroupedUser) return 'assistant';
+      if (nestedGroupedUser && !nestedGroupedAssistant) return 'user';
+
+      const nested = node.querySelector?.(roleSelector);
+      const nestedRole = nested?.getAttribute?.('data-message-author-role')
+        || nested?.getAttribute?.('data-role')
+        || nested?.getAttribute?.('data-message-author');
+      if (nestedRole === 'user' || nestedRole === 'assistant') return nestedRole;
+
+      // Do not assign a role to a grouped [data-turn-key] wrapper when it contains
+      // both roles. Doing so would merge a prompt and response into one PDF message.
+      if (node.matches?.(groupedTurnSelector)) {
+        const hasUser = Boolean(node.querySelector?.(groupedUserSelector));
+        const hasAssistant = Boolean(node.querySelector?.(`${groupedAssistantSelector}, ${groupedAssistantStartSelector}`));
+        if (hasUser && !hasAssistant) return 'user';
+        if (hasAssistant && !hasUser) return 'assistant';
+        if (hasUser && hasAssistant) return 'unknown';
+      }
+
+      if (node.matches?.('.user-turn') || node.querySelector?.('.user-turn')) return 'user';
+      if (node.matches?.('.agent-turn') || node.querySelector?.('.agent-turn')) return 'assistant';
+
+      const labelNodes = [...(node.querySelectorAll?.('h1, h2, h3, h4, h5, h6, [aria-label]') || [])].slice(0, 8);
+      const labelText = normalizeText(labelNodes.map((el) => `${el.getAttribute?.('aria-label') || ''} ${el.textContent || ''}`).join(' ')).toLowerCase();
+      if (/\b(you said|user message|your message)\b/.test(labelText)) return 'user';
+      if (/\b(chatgpt said|assistant message|assistant response)\b/.test(labelText)) return 'assistant';
+      return 'unknown';
+    }
+
+    function findGroupedAssistantBody(group) {
+      if (!group) return null;
+      const roleNode = group.querySelector?.(groupedAssistantSelector);
+      if (roleNode) return roleNode;
+
+      const startNode = group.querySelector?.(groupedAssistantStartSelector);
+      if (!startNode) return null;
+
+      // Some agent/tool turns expose only a start marker. Walk upward from that
+      // marker until we find a response-only subtree, but never cross into the
+      // group that also contains the user's bubble.
+      let current = startNode;
+      while (current?.parentElement && current.parentElement !== group) {
+        const parent = current.parentElement;
+        const containsUser = Boolean(parent.querySelector?.(groupedUserSelector));
+        const hasResponseContent = Boolean(parent.querySelector?.(
+          '.markdown, [class*="markdown"], [data-message-model-slug], [data-message-content-part], [data-conversation-role="assistant"]'
+        ));
+        if (!containsUser && hasResponseContent) return parent;
+        current = parent;
+      }
+      return startNode.parentElement && startNode.parentElement !== group ? startNode.parentElement : startNode;
+    }
+
+    function collectGroupedRendererNodes() {
+      const groups = [...document.querySelectorAll(groupedTurnSelector)]
+        .filter(outsideUiChrome)
+        .filter((node, index, all) => !all.some((other, otherIndex) => otherIndex !== index && other.contains(node)));
+      if (!groups.length) return [];
+
+      const nodes = [];
+      for (const group of groups) {
+        const user = group.querySelector?.(groupedUserSelector);
+        if (user && outsideUiChrome(user)) nodes.push(user);
+
+        const assistant = findGroupedAssistantBody(group);
+        if (assistant && outsideUiChrome(assistant)) nodes.push(assistant);
+      }
+      return sortInDocumentOrder([...new Set(nodes)]);
+    }
+
+    return {
+      getMessageNodes() {
+        // First support the current grouped renderer. This path is intentionally
+        // independent of the legacy role attributes because current A/B rollouts
+        // can report role=0 and turns=0 while [data-turn-key] is fully populated.
+        const grouped = collectGroupedRendererNodes();
+        if (grouped.length >= 2) return grouped;
+
+        const authored = [...document.querySelectorAll(roleSelector)]
+          .filter(outsideUiChrome)
+          .filter((node) => !node.closest?.(groupedTurnSelector))
+          .filter((node, index, all) => !all.some((other, otherIndex) => otherIndex !== index && other.contains(node) && inferRole(other) === inferRole(node)));
+        if (authored.length >= 2) return sortInDocumentOrder(authored);
+
+        const turns = [...document.querySelectorAll(legacyTurnSelector)]
+          .filter(outsideUiChrome)
+          .filter((node) => !node.closest?.(groupedTurnSelector))
+          .filter((node, index, all) => !all.some((other, otherIndex) => otherIndex !== index && other.contains(node)))
+          .filter((node) => ['user', 'assistant'].includes(inferRole(node)));
+        if (turns.length) return sortInDocumentOrder(turns);
+
+        // If only one current-renderer authored surface is mounted (for example
+        // while a reply is still streaming), return it rather than misclassifying
+        // composer/sidebar content as a turn.
+        if (grouped.length) return grouped;
+
+        const main = document.querySelector('main') || document.body;
+        return [...main.querySelectorAll('article, section')]
+          .filter(outsideUiChrome)
+          .filter((node) => ['user', 'assistant'].includes(inferRole(node)))
+          .filter((node, index, all) => !all.some((other, otherIndex) => otherIndex !== index && other.contains(node)))
+          .sort((a, b) => sortInDocumentOrder([a, b])[0] === a ? -1 : 1);
+      },
+      getRole(node) {
+        return inferRole(node);
+      },
+      findTurn(node) {
+        const role = inferRole(node);
+        if (role === 'user') {
+          const bubble = node.matches?.(groupedUserSelector) ? node : node.closest?.(groupedUserSelector);
+          if (bubble) return bubble;
+        }
+        if (role === 'assistant') {
+          // In the 2026 grouped ChatGPT renderer the aria/role marker can be
+          // only the short "ChatGPT said:" caption. The actual reply (including
+          // images and DIL-rich content) can be in following sibling elements.
+          // Use the full ONE-exchange wrapper for capture; serializeTurn removes
+          // the user surface from an assistant capture before exporting it.
+          const group = node.closest?.(groupedTurnSelector);
+          if (group) return group;
+          const roleNode = node.matches?.(groupedAssistantSelector) ? node : node.closest?.(groupedAssistantSelector);
+          if (roleNode) return roleNode;
+          const body = findGroupedAssistantBody(group);
+          if (body) return body;
+        }
+        return node.closest?.('section[data-turn], article[data-turn], [data-testid^="conversation-turn-"], [data-testid*="conversation-turn"], article, section') || node;
+      },
+      orderContainer(node) {
+        return node.closest?.(groupedTurnSelector) || this.findTurn(node);
+      },
+      identityMeta(node, turn, role) {
+        const group = node.closest?.(groupedTurnSelector) || turn?.closest?.(groupedTurnSelector);
+        const groupKey = group?.getAttribute?.('data-turn-key') || '';
+        if (groupKey) {
+          return {
+            stableId: looksUniqueDomId(groupKey) ? `${groupKey}:${role || inferRole(node)}` : '',
+            turnIndex: Number.NaN
+          };
+        }
+
+        const candidate = turn || node;
+        const testId = candidate?.getAttribute?.('data-testid') || '';
+        const match = testId.match(/conversation-turn-(\d+)/i);
+        const nestedIdNode = candidate?.querySelector?.('[data-message-id], [data-message-uuid], [data-turn-id]');
+        const explicit = node?.getAttribute?.('data-message-id')
+          || node?.getAttribute?.('data-message-uuid')
+          || node?.getAttribute?.('data-turn-id')
+          || candidate?.getAttribute?.('data-message-id')
+          || candidate?.getAttribute?.('data-message-uuid')
+          || candidate?.getAttribute?.('data-turn-id')
+          || nestedIdNode?.getAttribute?.('data-message-id')
+          || nestedIdNode?.getAttribute?.('data-message-uuid')
+          || nestedIdNode?.getAttribute?.('data-turn-id')
+          || candidate?.id
+          || '';
+        return {
+          stableId: looksUniqueDomId(explicit) ? explicit : '',
+          turnIndex: match ? Number(match[1]) : Number.NaN
+        };
+      },
+      nearbyIdentityText(node) {
+        const holder = node.closest?.(groupedTurnSelector) || this.findTurn(node);
+        const prev = holder?.previousElementSibling;
+        const next = holder?.nextElementSibling;
+        return normalizeText(`${prev?.innerText || ''}|${next?.innerText || ''}`).slice(0, 500);
+      },
+      getTitle() {
+        return cleanTitle(document.title, 'ChatGPT') || 'ChatGPT Conversation';
+      },
+      isAtConversationEnd(scrollContainer) {
+        return lastMessageNearViewportEnd(this.getMessageNodes(), scrollContainer);
+      }
+    };
+  }
+  // END GENERATED chatgpt provider adapter
+
+  // BEGIN GENERATED claude provider adapter
+  /** Claude DOM extraction adapter. No transport, media, or printing side effects. */
+  function createClaudeDomAdapter(context) {
+    const { outsideUiChrome, sortInDocumentOrder, normalizeText, looksUniqueDomId, cleanTitle, lastMessageNearViewportEnd } = context;
+    const userSelector = [
+      '[data-testid="user-message"]',
+      '[data-testid="human-message"]',
+      '[data-user-message-bubble="true"]',
+      '[data-message-author-role="user"]'
+    ].join(', ');
+    const assistantSelector = [
+      '.font-claude-response',
+      '.font-claude-response-body',
+      '.font-claude-message',
+      '[data-testid="ai-message"]',
+      '[data-testid="assistant-message"]',
+      '[data-testid="message-assistant"]',
+      '[data-message-author-role="assistant"]'
+    ].join(', ');
+
+    return {
+      getMessageNodes() {
+        const turnContainers = [...document.querySelectorAll('[data-test-render-count]')]
+          .filter((node) => !node.parentElement?.closest?.('[data-test-render-count]'))
+          .filter(outsideUiChrome);
+
+        const structural = [];
+        for (const turn of turnContainers) {
+          const user = turn.querySelector(userSelector);
+          if (user) {
+            structural.push(user);
+            continue;
+          }
+          const assistant = turn.querySelector(assistantSelector);
+          if (assistant) structural.push(assistant);
+        }
+        if (structural.length >= 2) return sortInDocumentOrder(structural);
+
+        const users = [...document.querySelectorAll(userSelector)].filter(outsideUiChrome);
+        const assistantCandidates = [...document.querySelectorAll(assistantSelector)].filter(outsideUiChrome);
+        const assistants = assistantCandidates.filter((node, index, all) => {
+          return !all.some((other, otherIndex) => otherIndex !== index && other.contains(node));
+        });
+        const combined = sortInDocumentOrder([...users, ...assistants]);
+        if (combined.length) return combined;
+
+        // Conservative fallback for a future Claude rollout: inspect rendered
+        // turn wrappers and retain only wrappers with an identifiable authored role.
+        return turnContainers.filter((turn) => turn.querySelector(userSelector) || turn.querySelector(assistantSelector));
+      },
+      getRole(node) {
+        if (node.matches?.(userSelector) || node.closest?.(userSelector)) return 'user';
+        if (node.matches?.(assistantSelector) || node.closest?.(assistantSelector)) return 'assistant';
+        const direct = node.getAttribute?.('data-message-author-role');
+        return direct === 'user' || direct === 'assistant' ? direct : 'unknown';
+      },
+      findTurn(node) {
+        // Keep serialization scoped to the authored body. The surrounding render
+        // wrapper contains action chrome and accessibility labels.
+        return node;
+      },
+      orderContainer(node) {
+        return node.closest?.('[data-test-render-count]') || node;
+      },
+      identityMeta(node) {
+        const explicit = node.getAttribute?.('data-message-id')
+          || node.getAttribute?.('data-message-uuid')
+          || node.id
+          || '';
+        return { stableId: looksUniqueDomId(explicit) ? explicit : '', turnIndex: Number.NaN };
+      },
+      nearbyIdentityText(node) {
+        const holder = node.closest?.('[data-test-render-count]') || node.parentElement;
+        const prev = holder?.previousElementSibling;
+        const next = holder?.nextElementSibling;
+        return normalizeText(`${prev?.innerText || ''}|${next?.innerText || ''}`).slice(0, 500);
+      },
+      getTitle() {
+        const browserTitle = cleanTitle(document.title, 'Claude');
+        if (browserTitle && browserTitle.toLowerCase() !== 'claude') return browserTitle;
+
+        const header = document.querySelector('[data-testid="chat-header"], [data-testid="page-header"], [data-testid="chat-title-split"]');
+        const heading = header?.querySelector('h1, h2, [data-testid*="title"], [data-test-id*="title"]');
+        const headingText = cleanTitle(normalizeText(heading?.innerText || heading?.textContent || ''), 'Claude');
+        if (headingText && headingText.toLowerCase() !== 'claude') return headingText;
+
+        const headerText = cleanTitle(normalizeText(header?.innerText || header?.textContent || ''), 'Claude');
+        if (headerText && headerText.toLowerCase() !== 'claude') return headerText;
+        return 'Claude Conversation';
+      },
+      isAtConversationEnd(scrollContainer) {
+        return lastMessageNearViewportEnd(this.getMessageNodes(), scrollContainer);
+      }
+    };
+  }
+  // END GENERATED claude provider adapter
+
+  // BEGIN GENERATED gemini provider adapter
+  /** Gemini DOM extraction adapter. No transport, media, or printing side effects. */
+  function createGeminiDomAdapter(context) {
+    const { outsideUiChrome, sortInDocumentOrder, normalizeText, looksUniqueDomId, cleanTitle, lastMessageNearViewportEnd } = context;
+    const userSelector = 'user-query, .user-query, .user-query-container, [data-message-author="user"], [data-message-author-role="user"]';
+    const assistantSelector = 'model-response, .model-response, .model-response-container, response-container, [data-message-author="assistant"], [data-message-author-role="assistant"]';
+
+    return {
+      getMessageNodes() {
+        const containers = [...document.querySelectorAll('.conversation-container')]
+          .filter((node) => !node.parentElement?.closest?.('.conversation-container'))
+          .filter(outsideUiChrome);
+        const structural = [];
+        for (const container of containers) {
+          const user = container.querySelector('user-query') || container.querySelector(userSelector);
+          const model = container.querySelector('model-response') || container.querySelector(assistantSelector);
+          if (user) structural.push(user);
+          if (model) structural.push(model);
+        }
+        if (structural.length) return sortInDocumentOrder(structural);
+
+        const primary = sortInDocumentOrder([
+          ...document.querySelectorAll(userSelector),
+          ...document.querySelectorAll(assistantSelector)
+        ])
+          .filter(outsideUiChrome)
+          .filter((node, index, all) => !all.some((other, otherIndex) => otherIndex !== index && other.contains(node) && this.getRole(other) === this.getRole(node)));
+        return primary;
+      },
+      getRole(node) {
+        const tag = node.tagName?.toLowerCase?.() || '';
+        if (tag === 'user-query' || node.matches?.(userSelector) || node.closest?.('user-query')) return 'user';
+        if (tag === 'model-response' || node.matches?.(assistantSelector) || node.closest?.('model-response')) return 'assistant';
+        return 'unknown';
+      },
+      findTurn(node) {
+        return node.closest?.('user-query, model-response, .user-query, .model-response, .user-query-container, .model-response-container, response-container') || node;
+      },
+      identityMeta(node, turn) {
+        const candidate = turn || node;
+        const explicit = candidate.getAttribute?.('data-message-id')
+          || candidate.getAttribute?.('data-response-id')
+          || candidate.getAttribute?.('data-id')
+          || candidate.id
+          || '';
+        return { stableId: looksUniqueDomId(explicit) ? explicit : '', turnIndex: Number.NaN };
+      },
+      nearbyIdentityText(node) {
+        const container = node.closest?.('.conversation-container');
+        const prev = container?.previousElementSibling;
+        const next = container?.nextElementSibling;
+        return normalizeText(`${prev?.innerText || ''}|${next?.innerText || ''}`).slice(0, 500);
+      },
+      getTitle() {
+        const title = cleanTitle(document.title, 'Gemini');
+        if (title && title.toLowerCase() !== 'gemini') return title;
+        const candidate = document.querySelector('[data-test-id="conversation-title"], [data-testid="conversation-title"], main h1');
+        return normalizeText(candidate?.innerText || candidate?.textContent || '') || 'Gemini Conversation';
+      },
+      isAtConversationEnd(scrollContainer) {
+        return lastMessageNearViewportEnd(this.getMessageNodes(), scrollContainer);
+      }
+    };
+  }
+  // END GENERATED gemini provider adapter
+
+  // Only dispatch is retained in the runtime controller. Each provider owns
+  // its DOM selection, role inference, identity, and per-turn boundaries.
   function createPlatformAdapter(platform) {
     const outsideUiChrome = (node) => !node.closest?.('nav, aside, [role="dialog"], [role="menu"], [role="listbox"]');
-
-    if (platform.id === "chatgpt") {
-      const roleSelector = [
-        '[data-message-author-role="user"]',
-        '[data-message-author-role="assistant"]',
-        '[data-role="user"]',
-        '[data-role="assistant"]',
-        '[data-message-author="user"]',
-        '[data-message-author="assistant"]'
-      ].join(', ');
-
-      const legacyTurnSelector = [
-        'section[data-turn="user"]',
-        'section[data-turn="assistant"]',
-        'article[data-turn="user"]',
-        'article[data-turn="assistant"]',
-        '[data-testid^="conversation-turn-"]',
-        '[data-testid*="conversation-turn"]',
-        '.user-turn',
-        '.agent-turn'
-      ].join(', ');
-
-      // ChatGPT's 2026 grouped renderer puts a user prompt and its assistant
-      // response under the same stable [data-turn-key] group. The old role/data-turn
-      // attributes can be completely absent in this rollout, so collect the two
-      // authored surfaces separately instead of treating the whole group as one turn.
-      const groupedTurnSelector = '[data-turn-key]';
-      const groupedUserSelector = '[data-user-message-bubble]';
-      const groupedAssistantSelector = '[data-conversation-role="assistant"]';
-      const groupedAssistantStartSelector = '[data-chatgpt-agent-turn-start]';
-
-      function inferRole(node) {
-        if (!node) return "unknown";
-
-        const direct = node.getAttribute?.('data-message-author-role')
-          || node.getAttribute?.('data-role')
-          || node.getAttribute?.('data-message-author')
-          || node.getAttribute?.('data-turn')
-          || node.getAttribute?.('data-conversation-role');
-        if (direct === 'user' || direct === 'assistant') return direct;
-
-        if (node.matches?.(groupedUserSelector) || node.closest?.(groupedUserSelector)) return 'user';
-        if (node.matches?.(groupedAssistantSelector) || node.closest?.(groupedAssistantSelector)) return 'assistant';
-        if (node.matches?.(groupedAssistantStartSelector) || node.closest?.(groupedAssistantStartSelector)) return 'assistant';
-        const nestedGroupedUser = Boolean(node.querySelector?.(groupedUserSelector));
-        const nestedGroupedAssistant = Boolean(node.querySelector?.(`${groupedAssistantSelector}, ${groupedAssistantStartSelector}`));
-        if (nestedGroupedAssistant && !nestedGroupedUser) return 'assistant';
-        if (nestedGroupedUser && !nestedGroupedAssistant) return 'user';
-
-        const nested = node.querySelector?.(roleSelector);
-        const nestedRole = nested?.getAttribute?.('data-message-author-role')
-          || nested?.getAttribute?.('data-role')
-          || nested?.getAttribute?.('data-message-author');
-        if (nestedRole === 'user' || nestedRole === 'assistant') return nestedRole;
-
-        // Do not assign a role to a grouped [data-turn-key] wrapper when it contains
-        // both roles. Doing so would merge a prompt and response into one PDF message.
-        if (node.matches?.(groupedTurnSelector)) {
-          const hasUser = Boolean(node.querySelector?.(groupedUserSelector));
-          const hasAssistant = Boolean(node.querySelector?.(`${groupedAssistantSelector}, ${groupedAssistantStartSelector}`));
-          if (hasUser && !hasAssistant) return 'user';
-          if (hasAssistant && !hasUser) return 'assistant';
-          if (hasUser && hasAssistant) return 'unknown';
-        }
-
-        if (node.matches?.('.user-turn') || node.querySelector?.('.user-turn')) return 'user';
-        if (node.matches?.('.agent-turn') || node.querySelector?.('.agent-turn')) return 'assistant';
-
-        const labelNodes = [...(node.querySelectorAll?.('h1, h2, h3, h4, h5, h6, [aria-label]') || [])].slice(0, 8);
-        const labelText = normalizeText(labelNodes.map((el) => `${el.getAttribute?.('aria-label') || ''} ${el.textContent || ''}`).join(' ')).toLowerCase();
-        if (/\b(you said|user message|your message)\b/.test(labelText)) return 'user';
-        if (/\b(chatgpt said|assistant message|assistant response)\b/.test(labelText)) return 'assistant';
-        return 'unknown';
-      }
-
-      function findGroupedAssistantBody(group) {
-        if (!group) return null;
-        const roleNode = group.querySelector?.(groupedAssistantSelector);
-        if (roleNode) return roleNode;
-
-        const startNode = group.querySelector?.(groupedAssistantStartSelector);
-        if (!startNode) return null;
-
-        // Some agent/tool turns expose only a start marker. Walk upward from that
-        // marker until we find a response-only subtree, but never cross into the
-        // group that also contains the user's bubble.
-        let current = startNode;
-        while (current?.parentElement && current.parentElement !== group) {
-          const parent = current.parentElement;
-          const containsUser = Boolean(parent.querySelector?.(groupedUserSelector));
-          const hasResponseContent = Boolean(parent.querySelector?.(
-            '.markdown, [class*="markdown"], [data-message-model-slug], [data-message-content-part], [data-conversation-role="assistant"]'
-          ));
-          if (!containsUser && hasResponseContent) return parent;
-          current = parent;
-        }
-        return startNode.parentElement && startNode.parentElement !== group ? startNode.parentElement : startNode;
-      }
-
-      function collectGroupedRendererNodes() {
-        const groups = [...document.querySelectorAll(groupedTurnSelector)]
-          .filter(outsideUiChrome)
-          .filter((node, index, all) => !all.some((other, otherIndex) => otherIndex !== index && other.contains(node)));
-        if (!groups.length) return [];
-
-        const nodes = [];
-        for (const group of groups) {
-          const user = group.querySelector?.(groupedUserSelector);
-          if (user && outsideUiChrome(user)) nodes.push(user);
-
-          const assistant = findGroupedAssistantBody(group);
-          if (assistant && outsideUiChrome(assistant)) nodes.push(assistant);
-        }
-        return sortInDocumentOrder([...new Set(nodes)]);
-      }
-
-      return {
-        getMessageNodes() {
-          // First support the current grouped renderer. This path is intentionally
-          // independent of the legacy role attributes because current A/B rollouts
-          // can report role=0 and turns=0 while [data-turn-key] is fully populated.
-          const grouped = collectGroupedRendererNodes();
-          if (grouped.length >= 2) return grouped;
-
-          const authored = [...document.querySelectorAll(roleSelector)]
-            .filter(outsideUiChrome)
-            .filter((node) => !node.closest?.(groupedTurnSelector))
-            .filter((node, index, all) => !all.some((other, otherIndex) => otherIndex !== index && other.contains(node) && inferRole(other) === inferRole(node)));
-          if (authored.length >= 2) return sortInDocumentOrder(authored);
-
-          const turns = [...document.querySelectorAll(legacyTurnSelector)]
-            .filter(outsideUiChrome)
-            .filter((node) => !node.closest?.(groupedTurnSelector))
-            .filter((node, index, all) => !all.some((other, otherIndex) => otherIndex !== index && other.contains(node)))
-            .filter((node) => ['user', 'assistant'].includes(inferRole(node)));
-          if (turns.length) return sortInDocumentOrder(turns);
-
-          // If only one current-renderer authored surface is mounted (for example
-          // while a reply is still streaming), return it rather than misclassifying
-          // composer/sidebar content as a turn.
-          if (grouped.length) return grouped;
-
-          const main = document.querySelector('main') || document.body;
-          return [...main.querySelectorAll('article, section')]
-            .filter(outsideUiChrome)
-            .filter((node) => ['user', 'assistant'].includes(inferRole(node)))
-            .filter((node, index, all) => !all.some((other, otherIndex) => otherIndex !== index && other.contains(node)))
-            .sort((a, b) => sortInDocumentOrder([a, b])[0] === a ? -1 : 1);
-        },
-        getRole(node) {
-          return inferRole(node);
-        },
-        findTurn(node) {
-          const role = inferRole(node);
-          if (role === 'user') {
-            const bubble = node.matches?.(groupedUserSelector) ? node : node.closest?.(groupedUserSelector);
-            if (bubble) return bubble;
-          }
-          if (role === 'assistant') {
-            // In the 2026 grouped ChatGPT renderer the aria/role marker can be
-            // only the short "ChatGPT said:" caption. The actual reply (including
-            // images and DIL-rich content) can be in following sibling elements.
-            // Use the full ONE-exchange wrapper for capture; serializeTurn removes
-            // the user surface from an assistant capture before exporting it.
-            const group = node.closest?.(groupedTurnSelector);
-            if (group) return group;
-            const roleNode = node.matches?.(groupedAssistantSelector) ? node : node.closest?.(groupedAssistantSelector);
-            if (roleNode) return roleNode;
-            const body = findGroupedAssistantBody(group);
-            if (body) return body;
-          }
-          return node.closest?.('section[data-turn], article[data-turn], [data-testid^="conversation-turn-"], [data-testid*="conversation-turn"], article, section') || node;
-        },
-        orderContainer(node) {
-          return node.closest?.(groupedTurnSelector) || this.findTurn(node);
-        },
-        identityMeta(node, turn, role) {
-          const group = node.closest?.(groupedTurnSelector) || turn?.closest?.(groupedTurnSelector);
-          const groupKey = group?.getAttribute?.('data-turn-key') || '';
-          if (groupKey) {
-            return {
-              stableId: looksUniqueDomId(groupKey) ? `${groupKey}:${role || inferRole(node)}` : '',
-              turnIndex: Number.NaN
-            };
-          }
-
-          const candidate = turn || node;
-          const testId = candidate?.getAttribute?.('data-testid') || '';
-          const match = testId.match(/conversation-turn-(\d+)/i);
-          const nestedIdNode = candidate?.querySelector?.('[data-message-id], [data-message-uuid], [data-turn-id]');
-          const explicit = node?.getAttribute?.('data-message-id')
-            || node?.getAttribute?.('data-message-uuid')
-            || node?.getAttribute?.('data-turn-id')
-            || candidate?.getAttribute?.('data-message-id')
-            || candidate?.getAttribute?.('data-message-uuid')
-            || candidate?.getAttribute?.('data-turn-id')
-            || nestedIdNode?.getAttribute?.('data-message-id')
-            || nestedIdNode?.getAttribute?.('data-message-uuid')
-            || nestedIdNode?.getAttribute?.('data-turn-id')
-            || candidate?.id
-            || '';
-          return {
-            stableId: looksUniqueDomId(explicit) ? explicit : '',
-            turnIndex: match ? Number(match[1]) : Number.NaN
-          };
-        },
-        nearbyIdentityText(node) {
-          const holder = node.closest?.(groupedTurnSelector) || this.findTurn(node);
-          const prev = holder?.previousElementSibling;
-          const next = holder?.nextElementSibling;
-          return normalizeText(`${prev?.innerText || ''}|${next?.innerText || ''}`).slice(0, 500);
-        },
-        getTitle() {
-          return cleanTitle(document.title, 'ChatGPT') || 'ChatGPT Conversation';
-        },
-        isAtConversationEnd(scrollContainer) {
-          return lastMessageNearViewportEnd(this.getMessageNodes(), scrollContainer);
-        }
-      };
-    }
-
-    if (platform.id === "claude") {
-      const userSelector = [
-        '[data-testid="user-message"]',
-        '[data-testid="human-message"]',
-        '[data-user-message-bubble="true"]',
-        '[data-message-author-role="user"]'
-      ].join(', ');
-      const assistantSelector = [
-        '.font-claude-response',
-        '.font-claude-response-body',
-        '.font-claude-message',
-        '[data-testid="ai-message"]',
-        '[data-testid="assistant-message"]',
-        '[data-testid="message-assistant"]',
-        '[data-message-author-role="assistant"]'
-      ].join(', ');
-
-      return {
-        getMessageNodes() {
-          const turnContainers = [...document.querySelectorAll('[data-test-render-count]')]
-            .filter((node) => !node.parentElement?.closest?.('[data-test-render-count]'))
-            .filter(outsideUiChrome);
-
-          const structural = [];
-          for (const turn of turnContainers) {
-            const user = turn.querySelector(userSelector);
-            if (user) {
-              structural.push(user);
-              continue;
-            }
-            const assistant = turn.querySelector(assistantSelector);
-            if (assistant) structural.push(assistant);
-          }
-          if (structural.length >= 2) return sortInDocumentOrder(structural);
-
-          const users = [...document.querySelectorAll(userSelector)].filter(outsideUiChrome);
-          const assistantCandidates = [...document.querySelectorAll(assistantSelector)].filter(outsideUiChrome);
-          const assistants = assistantCandidates.filter((node, index, all) => {
-            return !all.some((other, otherIndex) => otherIndex !== index && other.contains(node));
-          });
-          const combined = sortInDocumentOrder([...users, ...assistants]);
-          if (combined.length) return combined;
-
-          // Conservative fallback for a future Claude rollout: inspect rendered
-          // turn wrappers and retain only wrappers with an identifiable authored role.
-          return turnContainers.filter((turn) => turn.querySelector(userSelector) || turn.querySelector(assistantSelector));
-        },
-        getRole(node) {
-          if (node.matches?.(userSelector) || node.closest?.(userSelector)) return 'user';
-          if (node.matches?.(assistantSelector) || node.closest?.(assistantSelector)) return 'assistant';
-          const direct = node.getAttribute?.('data-message-author-role');
-          return direct === 'user' || direct === 'assistant' ? direct : 'unknown';
-        },
-        findTurn(node) {
-          // Keep serialization scoped to the authored body. The surrounding render
-          // wrapper contains action chrome and accessibility labels.
-          return node;
-        },
-        orderContainer(node) {
-          return node.closest?.('[data-test-render-count]') || node;
-        },
-        identityMeta(node) {
-          const explicit = node.getAttribute?.('data-message-id')
-            || node.getAttribute?.('data-message-uuid')
-            || node.id
-            || '';
-          return { stableId: looksUniqueDomId(explicit) ? explicit : '', turnIndex: Number.NaN };
-        },
-        nearbyIdentityText(node) {
-          const holder = node.closest?.('[data-test-render-count]') || node.parentElement;
-          const prev = holder?.previousElementSibling;
-          const next = holder?.nextElementSibling;
-          return normalizeText(`${prev?.innerText || ''}|${next?.innerText || ''}`).slice(0, 500);
-        },
-        getTitle() {
-          const browserTitle = cleanTitle(document.title, 'Claude');
-          if (browserTitle && browserTitle.toLowerCase() !== 'claude') return browserTitle;
-
-          const header = document.querySelector('[data-testid="chat-header"], [data-testid="page-header"], [data-testid="chat-title-split"]');
-          const heading = header?.querySelector('h1, h2, [data-testid*="title"], [data-test-id*="title"]');
-          const headingText = cleanTitle(normalizeText(heading?.innerText || heading?.textContent || ''), 'Claude');
-          if (headingText && headingText.toLowerCase() !== 'claude') return headingText;
-
-          const headerText = cleanTitle(normalizeText(header?.innerText || header?.textContent || ''), 'Claude');
-          if (headerText && headerText.toLowerCase() !== 'claude') return headerText;
-          return 'Claude Conversation';
-        },
-        isAtConversationEnd(scrollContainer) {
-          return lastMessageNearViewportEnd(this.getMessageNodes(), scrollContainer);
-        }
-      };
-    }
-
-    if (platform.id === "gemini") {
-      const userSelector = 'user-query, .user-query, .user-query-container, [data-message-author="user"], [data-message-author-role="user"]';
-      const assistantSelector = 'model-response, .model-response, .model-response-container, response-container, [data-message-author="assistant"], [data-message-author-role="assistant"]';
-
-      return {
-        getMessageNodes() {
-          const containers = [...document.querySelectorAll('.conversation-container')]
-            .filter((node) => !node.parentElement?.closest?.('.conversation-container'))
-            .filter(outsideUiChrome);
-          const structural = [];
-          for (const container of containers) {
-            const user = container.querySelector('user-query') || container.querySelector(userSelector);
-            const model = container.querySelector('model-response') || container.querySelector(assistantSelector);
-            if (user) structural.push(user);
-            if (model) structural.push(model);
-          }
-          if (structural.length) return sortInDocumentOrder(structural);
-
-          const primary = sortInDocumentOrder([
-            ...document.querySelectorAll(userSelector),
-            ...document.querySelectorAll(assistantSelector)
-          ])
-            .filter(outsideUiChrome)
-            .filter((node, index, all) => !all.some((other, otherIndex) => otherIndex !== index && other.contains(node) && this.getRole(other) === this.getRole(node)));
-          return primary;
-        },
-        getRole(node) {
-          const tag = node.tagName?.toLowerCase?.() || '';
-          if (tag === 'user-query' || node.matches?.(userSelector) || node.closest?.('user-query')) return 'user';
-          if (tag === 'model-response' || node.matches?.(assistantSelector) || node.closest?.('model-response')) return 'assistant';
-          return 'unknown';
-        },
-        findTurn(node) {
-          return node.closest?.('user-query, model-response, .user-query, .model-response, .user-query-container, .model-response-container, response-container') || node;
-        },
-        identityMeta(node, turn) {
-          const candidate = turn || node;
-          const explicit = candidate.getAttribute?.('data-message-id')
-            || candidate.getAttribute?.('data-response-id')
-            || candidate.getAttribute?.('data-id')
-            || candidate.id
-            || '';
-          return { stableId: looksUniqueDomId(explicit) ? explicit : '', turnIndex: Number.NaN };
-        },
-        nearbyIdentityText(node) {
-          const container = node.closest?.('.conversation-container');
-          const prev = container?.previousElementSibling;
-          const next = container?.nextElementSibling;
-          return normalizeText(`${prev?.innerText || ''}|${next?.innerText || ''}`).slice(0, 500);
-        },
-        getTitle() {
-          const title = cleanTitle(document.title, 'Gemini');
-          if (title && title.toLowerCase() !== 'gemini') return title;
-          const candidate = document.querySelector('[data-test-id="conversation-title"], [data-testid="conversation-title"], main h1');
-          return normalizeText(candidate?.innerText || candidate?.textContent || '') || 'Gemini Conversation';
-        },
-        isAtConversationEnd(scrollContainer) {
-          return lastMessageNearViewportEnd(this.getMessageNodes(), scrollContainer);
-        }
-      };
-    }
-
+    const context = {
+      outsideUiChrome, sortInDocumentOrder, normalizeText, looksUniqueDomId,
+      cleanTitle, lastMessageNearViewportEnd
+    };
+    if (platform.id === 'chatgpt') return createChatGPTDomAdapter(context);
+    if (platform.id === 'claude') return createClaudeDomAdapter(context);
+    if (platform.id === 'gemini') return createGeminiDomAdapter(context);
     return {
       getMessageNodes() { return []; },
       getRole() { return 'unknown'; },

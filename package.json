@@ -5,6 +5,8 @@
   "description": "Developer commands and provider-neutral domain contracts for ChatFolio",
   "scripts": {
     "check": "node scripts/check.mjs",
+    "bundle": "node scripts/bundle.mjs --write",
+    "bundle:check": "node scripts/bundle.mjs --check",
     "build": "python3 scripts/build.py",
     "test": "npm run test:core && npm run test:browser",
     "verify": "npm run check && npm run test && npm run build",

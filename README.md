@@ -130,3 +130,8 @@ Run `npm run test:core` for fast domain contract checks, or `npm test` for
 those checks plus the 13 browser regressions. The shipped extension still
 uses the existing `content.js`: the new contracts are a migration foundation,
 not a claim that provider adapters have already been split.
+
+## Refactoring status (phase 3 / step A)
+
+Provider DOM adapters are separate ESM modules under `src/providers/`.
+Run `npm run bundle` after source changes and see `docs/architecture/0003-provider-dom-adapters.md`.
