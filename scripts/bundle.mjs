@@ -18,6 +18,12 @@ const providers = Object.freeze([
   ['gemini', 'Gemini'],
 ]);
 const marker = '  /* @chatfolio-provider-adapters */';
+const metadataMarker = '  /* @chatfolio-chatgpt-metadata */';
+const metadataNames = Object.freeze([
+  'getChatGPTConversationContext', 'decodeJwtPayload', 'getChatGPTAccountId',
+  'collectChatGPTBranch', 'orderChatGPTShareNodes', 'extractChatGPTTurboChunks',
+  'decodeChatGPTTurboStreamFromSource', 'findChatGPTShareContainer'
+]);
 const source = readFileSync(join(root, 'src/content/main.js'), 'utf8');
 if (source.split(marker).length !== 2) throw new Error('Content template must contain exactly one provider insertion marker');
 
@@ -37,7 +43,21 @@ const definitions = providers.map(([id, title]) => {
     local.split('\n').map(line => line ? `  ${line}` : '').join('\n') +
     `\n  // END GENERATED ${id} provider adapter`;
 });
-const generated = source.replace(marker, definitions.join('\n\n'));
+const metadataSource = readFileSync(join(root, 'src/providers/chatgpt/metadata-parser.js'), 'utf8').trimEnd();
+if (source.split(metadataMarker).length !== 2 ||
+    /^\s*import\s/m.test(metadataSource) ||
+    /\bexport\s+(?!function\s)/m.test(metadataSource)) {
+  throw new Error('Unsupported ChatGPT metadata module or missing injection marker');
+}
+const declaredNames = Array.from(metadataSource.matchAll(/^export function (\w+)\(/gm), match => match[1]);
+if (declaredNames.length !== metadataNames.length ||
+    declaredNames.some((name, i) => name !== metadataNames[i])) {
+  throw new Error('ChatGPT metadata export contract mismatch');
+}
+const embeddedMetadata = metadataSource.replace(/^export function /gm, 'function ')
+  .split('\n').map(line => line ? `  ${line}` : '').join('\n');
+const generated = source.replace(marker, definitions.join('\n\n'))
+  .replace(metadataMarker, `  // BEGIN GENERATED ChatGPT metadata parsers\n${embeddedMetadata}\n  // END GENERATED ChatGPT metadata parsers`);
 const dest = join(root, 'content.js');
 if (process.argv.includes('--write')) {
   writeFileSync(dest, generated, 'utf8');

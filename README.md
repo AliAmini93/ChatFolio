@@ -135,3 +135,11 @@ not a claim that provider adapters have already been split.
 
 Provider DOM adapters are separate ESM modules under `src/providers/`.
 Run `npm run bundle` after source changes and see `docs/architecture/0003-provider-dom-adapters.md`.
+
+### Architecture refactor: phase 3B1
+
+ChatGPT's conversation-branch and shared-page metadata decoders are now an
+independent, tested module (`src/providers/chatgpt/metadata-parser.js`). The
+shipping single-file MV3 content script is generated deterministically;
+transport, media, and long-chat scanning are not yet migrated. See
+[ADR 0003B1](docs/architecture/0003b1-chatgpt-metadata-parsers.md).

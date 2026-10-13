@@ -70,3 +70,13 @@ After changing these sources, run `npm run bundle && npm run check`.
 The generator refuses unexpected imports/exports. Test the emitted classic
 script with `CHATFOLIO_CHROMIUM=/usr/bin/chromium npm test` before committing.
 See ADR 0003 for the temporary bundler rationale.
+
+## Phase 3B1: ChatGPT conversation/share parsers
+
+Edit `src/providers/chatgpt/metadata-parser.js` for ChatGPT route, JWT, active
+branch, public-share ordering or React Router hydration parsing changes.
+`src/content/main.js` has only the injection marker and continues to own fetch
+and rendering orchestration. Rebuild using `npm run bundle`. The generated
+`content.js` must be committed with the source changes; CI checks its freshness.
+Run `npm run test:core` for `tests/unit/chatgpt-metadata.test.mjs` and the other
+unit cases, and `npm test` for Chromium regressions. See ADR 0003B1.
