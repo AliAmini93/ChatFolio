@@ -55,3 +55,12 @@ legacy share and asset-download requests inside this factory. The classic MV3
 content script receives the factory through the deterministic bundler; no
 module imports execute inside injected `content.js`. The caller retains Stop,
 progress, DOM scanning and rendering. See ADR 0003B2.
+
+## Gemini history loading (Phase 3B3)
+
+`gemini/history-scanner.js` now owns the production Gemini lazy-history polling,
+turn count, media-aware message capture and incomplete-export guards. It
+receives its DOM, scroll, serializer, cancellation and progress dependencies
+from the controller, and its single ESM factory is embedded in generated
+`content.js` by `scripts/bundle.mjs`. The controller continues to own scroll
+restoration and the print/visual fallback pipeline. See ADR 0003B3.
