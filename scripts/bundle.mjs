@@ -56,8 +56,20 @@ if (declaredNames.length !== metadataNames.length ||
 }
 const embeddedMetadata = metadataSource.replace(/^export function /gm, 'function ')
   .split('\n').map(line => line ? `  ${line}` : '').join('\n');
+const transportMarker = '  /* @chatfolio-chatgpt-transport */';
+const transportSource = readFileSync(join(root, 'src/providers/chatgpt/transport.js'), 'utf8').trimEnd();
+if (source.split(transportMarker).length !== 2 ||
+    !transportSource.includes('export function createChatGPTTransport({') ||
+    (transportSource.match(/\bexport\s+function\b/g) ?? []).length !== 1 ||
+    /^\s*import\s/m.test(transportSource) ||
+    /\bexport\s+(?!function\s)/m.test(transportSource)) {
+  throw new Error('ChatGPT transport module or insertion marker has invalid structure');
+}
+const embeddedTransport = transportSource.replace('export function createChatGPTTransport({', 'function createChatGPTTransport({')
+  .split('\n').map(line => line ? `  ${line}` : '').join('\n');
 const generated = source.replace(marker, definitions.join('\n\n'))
-  .replace(metadataMarker, `  // BEGIN GENERATED ChatGPT metadata parsers\n${embeddedMetadata}\n  // END GENERATED ChatGPT metadata parsers`);
+  .replace(metadataMarker, `  // BEGIN GENERATED ChatGPT metadata parsers\n${embeddedMetadata}\n  // END GENERATED ChatGPT metadata parsers`)
+  .replace(transportMarker, `  // BEGIN GENERATED ChatGPT transport\n${embeddedTransport}\n  // END GENERATED ChatGPT transport`);
 const dest = join(root, 'content.js');
 if (process.argv.includes('--write')) {
   writeFileSync(dest, generated, 'utf8');

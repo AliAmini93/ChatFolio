@@ -80,3 +80,15 @@ and rendering orchestration. Rebuild using `npm run bundle`. The generated
 `content.js` must be committed with the source changes; CI checks its freshness.
 Run `npm run test:core` for `tests/unit/chatgpt-metadata.test.mjs` and the other
 unit cases, and `npm test` for Chromium regressions. See ADR 0003B1.
+
+## Phase 3B2: ChatGPT transport
+
+ChatGPT network requests now live in `src/providers/chatgpt/transport.js`.
+Use `npm run test:core` for mocked session, share, conversation and attachment
+requests; run `npm test` for the generated content script and browser fixtures.
+Run `npm run bundle && npm run check` after editing the module. See ADR 0003B2.
+
+For an existing Ubuntu Python environment, activate its `bin/activate` script
+before `npm test`; `scripts/test.py` runs each browser test with that same Python
+interpreter (`sys.executable`). Set `CHATFOLIO_CHROMIUM=/usr/bin/chromium` if
+Playwright-managed Chromium is not installed in that environment.

@@ -10,7 +10,6 @@
   })();
   const PLATFORM = detectPlatform();
   const ADAPTER = createPlatformAdapter(PLATFORM);
-  const chatGPTAssetUrlCache = new Map();
   // Some scrollports use column-reverse. Chromium then reports scrollTop
   // in [-scrollRange, 0], with 0 being the *bottom*. Track only scrollports
   // proven by the movement probe; other platforms keep their old behavior.
@@ -194,6 +193,16 @@
 
   /* @chatfolio-chatgpt-metadata */
 
+  /* @chatfolio-chatgpt-transport */
+
+  const CHATGPT_TRANSPORT = createChatGPTTransport({
+    fetchImpl: (resource, options) => fetch(resource, options),
+    getOrigin: () => location.origin,
+    getChatGPTAccountId, chatGPTAssetPointerInfo,
+    parsePublicShare: (html) => findChatGPTShareContainer(decodeChatGPTTurboStreamFromSource(html)),
+    makeCancelledError
+  });
+
 
 
   // Only dispatch is retained in the runtime controller. Each provider owns
@@ -276,96 +285,6 @@
     return { kind: "", value: pointer || directUrl, fileId: "" };
   }
 
-  function downloadUrlFromPayload(payload) {
-    if (!payload || typeof payload !== "object") return "";
-    return String(
-      payload.download_url
-      || payload.downloadUrl
-      || payload.signed_url
-      || payload.signedUrl
-      || payload.url
-      || payload.file_url
-      || payload.fileUrl
-      || ""
-    ).trim();
-  }
-
-  async function requestChatGPTAssetDownloadUrl(part, context, headers, signal) {
-    const info = chatGPTAssetPointerInfo(part);
-    if (info.kind === "url" && info.value) return info.value;
-    if (!info.fileId) return "";
-
-    const cacheKey = `${context?.conversationId || ""}|${context?.shareId || ""}|${info.kind}|${info.fileId}`;
-    if (chatGPTAssetUrlCache.has(cacheKey)) return chatGPTAssetUrlCache.get(cacheKey);
-
-    const promise = (async () => {
-      const encodedFileId = encodeURIComponent(info.fileId);
-      const encodedConversationId = encodeURIComponent(context?.conversationId || "");
-      const encodedShareId = encodeURIComponent(context?.shareId || "");
-      const endpoints = [];
-
-      // Shared conversations expose attachment references through the share id, not
-      // the /c/<conversation-id> route. Prefer that resolver when available.
-      if (context?.shareId) {
-        endpoints.push(`/backend-api/files/${encodedFileId}/download?shared_conversation_id=${encodedShareId}`);
-      }
-
-      if (info.kind === "sediment") {
-        if (context?.conversationId) {
-          endpoints.push(`/backend-api/conversation/${encodedConversationId}/attachment/${encodedFileId}/download`);
-        }
-      } else {
-        if (context?.conversationId) {
-          endpoints.push(`/backend-api/files/download/${encodedFileId}?conversation_id=${encodedConversationId}&inline=true`);
-        }
-        endpoints.push(`/backend-api/files/${encodedFileId}/download`);
-      }
-
-      for (const endpoint of endpoints) {
-        if (signal?.aborted) throw makeCancelledError();
-        try {
-          const response = await fetch(endpoint, {
-            method: "GET",
-            credentials: "include",
-            cache: "no-store",
-            redirect: "follow",
-            headers: {
-              ...headers,
-              Accept: "application/json, image/*, */*"
-            },
-            signal
-          });
-          if (!response.ok) continue;
-
-          const contentType = String(response.headers.get("content-type") || "").toLowerCase();
-          if (contentType.includes("application/json") || contentType.includes("text/json")) {
-            const payload = await response.json().catch(() => null);
-            const url = downloadUrlFromPayload(payload);
-            if (url) return url;
-            continue;
-          }
-
-          if (response.url && /^https:\/\//i.test(response.url) && response.url !== new URL(endpoint, location.origin).href) {
-            return response.url;
-          }
-        } catch (error) {
-          if (signal?.aborted) throw makeCancelledError();
-        }
-      }
-      return "";
-    })();
-
-    chatGPTAssetUrlCache.set(cacheKey, promise);
-    try {
-      const url = await promise;
-      chatGPTAssetUrlCache.set(cacheKey, Promise.resolve(url));
-      return url;
-    } catch (error) {
-      chatGPTAssetUrlCache.delete(cacheKey);
-      throw error;
-    }
-  }
-
   function chatGPTMediaLabel(part, fallback = "Image attachment") {
     return String(
       part?.metadata?.name
@@ -378,7 +297,7 @@
 
   async function renderChatGPTImagePart(part, context, headers, signal, embedImages, role) {
     const label = chatGPTMediaLabel(part);
-    const remoteUrl = await requestChatGPTAssetDownloadUrl(part, context, headers, signal);
+    const remoteUrl = await CHATGPT_TRANSPORT.requestAssetDownloadUrl(part, context, headers, signal);
     if (!remoteUrl) return { html: `<div class="attachment-card">${escapeHtml(label)}</div>`, mediaCount: 1 };
 
     let src = remoteUrl;
@@ -579,76 +498,6 @@
     return findChatGPTShareContainer(root);
   }
 
-  async function fetchChatGPTShareFromPublicPage(signal) {
-    // Public share pages serialize the conversation into React Router hydration
-    // data. First inspect the already-loaded document, then refetch the PUBLIC page
-    // without account cookies. The anonymous response is often more fully SSR'd
-    // than the signed-in SPA shell and avoids workspace/account-specific routing.
-    let share = null;
-    try {
-      share = decodeChatGPTShareFromLoadedDocument();
-    } catch {
-      share = null;
-    }
-    if (share) return share;
-
-    const attempts = [
-      { credentials: "omit", label: "anonymous public page" },
-      { credentials: "include", label: "signed-in public page" }
-    ];
-    const errors = [];
-
-    for (const attempt of attempts) {
-      try {
-        const response = await fetch(location.href, {
-          method: "GET",
-          credentials: attempt.credentials,
-          cache: "no-store",
-          headers: {
-            Accept: "text/html,application/xhtml+xml",
-            "Cache-Control": "no-cache"
-          },
-          signal
-        });
-        if (!response.ok) {
-          errors.push(`${attempt.label} HTTP ${response.status}`);
-          continue;
-        }
-        const html = await response.text();
-        const root = decodeChatGPTTurboStreamFromSource(html);
-        share = findChatGPTShareContainer(root);
-        if (share) return share;
-        errors.push(`${attempt.label} had hydration data but no complete conversation object`);
-      } catch (error) {
-        if (signal?.aborted) throw makeCancelledError();
-        errors.push(`${attempt.label}: ${error?.message || error}`);
-      }
-    }
-
-    throw new Error(`ChatGPT public share page did not expose a complete conversation (${errors.join("; ")}).`);
-  }
-
-  async function getOptionalChatGPTAuthHeaders(signal) {
-    try {
-      const sessionResponse = await fetch("/api/auth/session", {
-        credentials: "include",
-        cache: "no-store",
-        signal
-      });
-      if (!sessionResponse.ok) return {};
-      const authSession = await sessionResponse.json();
-      const accessToken = authSession?.accessToken || "";
-      if (!accessToken) return {};
-      const headers = { Authorization: `Bearer ${accessToken}` };
-      const accountId = getChatGPTAccountId(authSession, accessToken);
-      if (accountId) headers["ChatGPT-Account-ID"] = accountId;
-      return headers;
-    } catch (error) {
-      if (signal?.aborted) throw makeCancelledError();
-      return {};
-    }
-  }
-
   async function collectChatGPTShareViaMetadata(options, session, context) {
     const signal = session.controller.signal;
     throwIfCancelled(session);
@@ -664,7 +513,7 @@
     let share;
     let publicPageError = null;
     try {
-      share = await fetchChatGPTShareFromPublicPage(signal);
+      share = await CHATGPT_TRANSPORT.getPublicShare(signal, decodeChatGPTShareFromLoadedDocument, location.href);
     } catch (error) {
       if (signal?.aborted) throw makeCancelledError();
       publicPageError = error;
@@ -676,19 +525,15 @@
     // contains the complete first-party hydration payload.
     if (!share) {
       const endpoint = `/backend-api/share/${encodeURIComponent(context.shareId)}`;
-      const authHeaders = await getOptionalChatGPTAuthHeaders(signal);
-      const response = await fetch(endpoint, {
-        method: "GET",
-        credentials: "include",
-        cache: "no-store",
-        headers: { Accept: "application/json", ...authHeaders },
-        signal
-      });
-      if (!response.ok) {
-        const prefix = publicPageError?.message ? `${publicPageError.message} ` : "";
-        throw new Error(`${prefix}Legacy shared-conversation endpoint returned HTTP ${response.status}.`);
+      const authHeaders = await CHATGPT_TRANSPORT.getOptionalAuthHeaders(signal);
+      try {
+        share = await CHATGPT_TRANSPORT.getLegacyShare(context.shareId, authHeaders, signal);
+      } catch (error) {
+        if (error?.status !== undefined && publicPageError?.message) {
+          throw new Error(`${publicPageError.message} ${error.message}`);
+        }
+        throw error;
       }
-      share = await response.json();
     }
     throwIfCancelled(session);
     const nodes = orderChatGPTShareNodes(share);
@@ -702,7 +547,7 @@
       running: true
     });
 
-    const headers = await getOptionalChatGPTAuthHeaders(signal);
+    const headers = await CHATGPT_TRANSPORT.getOptionalAuthHeaders(signal);
     const mediaContext = {
       ...context,
       conversationId: String(share?.conversation_id || ""),
@@ -763,12 +608,7 @@
       running: true
     });
 
-    const sessionResponse = await fetch("/api/auth/session", {
-      credentials: "include",
-      cache: "no-store",
-      signal
-    });
-    if (!sessionResponse.ok) throw new Error(`ChatGPT session metadata returned HTTP ${sessionResponse.status}.`);
+    const { accessToken, accountId } = await CHATGPT_TRANSPORT.getRequiredAuth(signal);
     notifyProgress({
       percent: 12,
       messageCount: 0,
@@ -776,22 +616,6 @@
       status: "Authenticated. Requesting the complete ChatGPT conversation...",
       running: true
     });
-    const authSession = await sessionResponse.json();
-    const accessToken = authSession?.accessToken || "";
-    if (!accessToken) throw new Error("ChatGPT session metadata did not provide a temporary access token.");
-    const accountId = getChatGPTAccountId(authSession, accessToken);
-    if (!accountId) throw new Error("ChatGPT account metadata could not be resolved for this conversation.");
-
-    const endpoint = `/backend-api/conversation/${encodeURIComponent(context.conversationId)}`;
-    const headers = {
-      Accept: "application/json",
-      Authorization: `Bearer ${accessToken}`,
-      "ChatGPT-Account-ID": accountId,
-      "X-OpenAI-Target-Path": endpoint,
-      "X-OpenAI-Target-Route": "/backend-api/conversation/{conversation_id}"
-    };
-    if (context.projectId) headers["chatgpt-project-id"] = context.projectId;
-
     notifyProgress({
       percent: 20,
       messageCount: 0,
@@ -799,16 +623,7 @@
       status: "Downloading the active ChatGPT conversation branch...",
       running: true
     });
-
-    const response = await fetch(endpoint, {
-      method: "GET",
-      credentials: "include",
-      cache: "no-store",
-      headers,
-      signal
-    });
-    if (!response.ok) throw new Error(`ChatGPT conversation metadata returned HTTP ${response.status}.`);
-    const conversation = await response.json();
+    const { conversation, headers } = await CHATGPT_TRANSPORT.getConversation(context, accessToken, accountId, signal);
     throwIfCancelled(session);
 
     const branch = collectChatGPTBranch(conversation);

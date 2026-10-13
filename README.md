@@ -143,3 +143,11 @@ independent, tested module (`src/providers/chatgpt/metadata-parser.js`). The
 shipping single-file MV3 content script is generated deterministically;
 transport, media, and long-chat scanning are not yet migrated. See
 [ADR 0003B1](docs/architecture/0003b1-chatgpt-metadata-parsers.md).
+
+### Engineering refactor milestone — ChatGPT transport (Phase 3B2)
+
+The source code now isolates ChatGPT session, conversation, public-share, legacy
+share, and attachment URL requests in `src/providers/chatgpt/transport.js`.
+This is a structural change; the published Stable release remains v1.8.11.
+No provider permissions or export UI were changed. See
+`docs/architecture/0003b2-chatgpt-transport.md` for compatibility boundaries.
