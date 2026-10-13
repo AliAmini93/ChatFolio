@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** Dependency-free sanity checks for the current pre-refactor runtime. */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, statSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 const root = resolve(import.meta.dirname, '..');
@@ -26,3 +26,16 @@ for (const file of runtimeFiles) {
   console.log(`Syntax OK: ${file}`);
 }
 console.log(`Runtime integrity OK: manifest v${manifest.version}`);
+
+// Phase-2 pure domain modules and unit tests are also syntax-checked.
+function collectModules(dir, suffix) {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) return collectModules(path, suffix);
+    return entry.isFile() && entry.name.endsWith(suffix) ? [path] : [];
+  });
+}
+for (const file of [...collectModules(join(root, 'src'), '.js'), ...collectModules(join(root, 'tests', 'unit'), '.mjs')]) {
+  execFileSync(process.execPath, ['--check', file], { stdio: 'inherit' });
+  console.log(`Syntax OK: ${file.slice(root.length + 1)}`);
+}

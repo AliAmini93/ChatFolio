@@ -2,14 +2,17 @@
   "name": "chatfolio",
   "version": "1.8.11",
   "private": true,
-  "description": "Developer commands for the ChatFolio Chrome extension (legacy runtime)",
+  "description": "Developer commands and provider-neutral domain contracts for ChatFolio",
   "scripts": {
     "check": "node scripts/check.mjs",
     "build": "python3 scripts/build.py",
-    "test": "python3 scripts/test.py",
-    "verify": "npm run check && npm run test && npm run build"
+    "test": "npm run test:core && npm run test:browser",
+    "verify": "npm run check && npm run test && npm run build",
+    "test:core": "node --test tests/unit/*.test.mjs",
+    "test:browser": "python3 scripts/test.py"
   },
   "engines": {
     "node": ">=22"
-  }
+  },
+  "type": "module"
 }

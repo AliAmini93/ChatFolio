@@ -121,3 +121,12 @@ Developer commands: `npm run check` validates syntax and manifest assets,
 `npm test` runs the Chromium regression fixtures, and `npm run build` makes the
 Chrome ZIP from an explicit allowlist. GitHub Actions runs these for pull
 requests. This does **not** replace real-session smoke testing on provider sites.
+
+## Architecture migration (phase 2)
+
+Provider-neutral conversation and adapter contracts live in `src/core/` and
+are described in [ADR 0002](docs/architecture/0002-conversation-contracts.md).
+Run `npm run test:core` for fast domain contract checks, or `npm test` for
+those checks plus the 13 browser regressions. The shipped extension still
+uses the existing `content.js`: the new contracts are a migration foundation,
+not a claim that provider adapters have already been split.
