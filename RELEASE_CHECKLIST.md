@@ -1,22 +1,24 @@
-# ChatFolio v1.8.8 pre-release checklist
+# ChatFolio v1.8.11 release checklist
 
-## Extension package
-- [x] Manifest V3; version is 1.8.8
-- [x] Chrome ZIP contains runtime files, icons, privacy policy, and license, but no tests or personal chat exports
-- [x] JS syntax checks and local DOM/print regression tests
-- [x] Real ChatGPT Temporary Chat PDF export verified (16 messages, 11 pages)
-- [ ] Real-world regression with multiple chats including Claude and Gemini
+## Verified in this build
+- [x] Manifest V3 and `manifest.json` version `1.8.11`
+- [x] Chrome ZIP contains only runtime assets and icons
+- [x] Chrome ZIP runtime bytes match the source tree
+- [x] JavaScript syntax validation and Python test syntax validation
+- [x] Synthetic Chromium checks: Gemini uploads (including off-screen/CORS), Claude uploads, print/pagination, negative scrolling, grouped responses, table headers
+- [x] Real PDF smoke tests on ChatGPT, Claude, and Gemini
+- [x] No private conversation PDFs or uploaded screenshots included in the source/release ZIP
 
-## GitHub
-- [ ] Push v1.8.8 source to a feature branch with PR review
-- [ ] Update main after verification
-- [ ] Create `v1.8.8` pre-release tag / GitHub Release
-- [ ] Attach `chatfolio-1.8.8-chrome.zip` (installable extension)
-- [ ] Attach `chatfolio-1.8.8-source.zip` (optional full sources/tests)
+## GitHub publishing
+- [ ] Merge the reviewed v1.8.11 update into `main`
+- [ ] Pull updated `main` into local repository
+- [ ] Set the repository About description and topics
+- [ ] Create and push annotated tag `v1.8.11`
+- [ ] Publish `v1.8.11` as the latest stable release
+- [ ] Upload `chatfolio-1.8.11-chrome.zip` as the release asset
+- [ ] Verify downloadable ZIP and tag in GitHub release UI
 
-## Public distribution
-- [ ] Test with Chrome + recent Chromium print engine
-- [ ] Confirm page numbering, tables, images, citations, RTL and code blocks in more samples
-- [ ] Update Chrome Web Store only after independent smoke testing
-
-The real Temporary Chat sample PDF contains personal shopping details and must never be committed as a fixture or attached to a public release.
+## Chrome Web Store (optional, separate distribution step)
+- [ ] Review Store listing screenshots and permissions
+- [ ] Upload the new ZIP to the Chrome Web Store developer dashboard
+- [ ] Review privacy/data-use disclosures and submit update

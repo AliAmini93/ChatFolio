@@ -1,18 +1,18 @@
 # ChatFolio
 
-Current pre-release candidate: **1.8.8**. Stable public release: **1.8.0**.
+Current release: **1.8.11**. This version includes validated ChatGPT, Claude, and Gemini PDF export improvements.
 
 ChatFolio is a Chrome extension for exporting ChatGPT, Claude, and Gemini conversations to printable, searchable PDF documents when semantic extraction is available. When it isn't, the extension offers an assisted screenshot-based Visual Backup.
 
 ## Installation
 
-1. Extract `chatfolio-1.8.8-chrome.zip`.
+1. Extract `chatfolio-1.8.11-chrome.zip`.
 2. Open `chrome://extensions/` in Chrome and enable **Developer mode**.
-3. Choose **Load unpacked**, and select the extracted `chatfolio-1.8.8` folder containing `manifest.json`.
+3. Choose **Load unpacked**, and select the extracted `chatfolio-1.8.11` folder containing `manifest.json`.
 4. Open a supported conversation and choose **Export full chat** from the ChatFolio popup.
 5. In the Chrome print dialog, choose **Save as PDF**. Recent Chromium versions suppress their default page headers/footers through ChatFolio print CSS. If your browser still shows them, disable **Headers and footers**.
 
-**Temporary Chat safety:** Do not refresh a still-open Temporary Chat tab just to update ChatFolio. Disable the older extension and load the new unpacked directory. ChatFolio 1.8.8 will not automatically reload Temporary Chat pages when an old content script is detected.
+**Temporary Chat safety:** Do not refresh a still-open Temporary Chat tab just to update ChatFolio. Disable the older extension and load the new unpacked directory. ChatFolio 1.8.11 will not automatically reload Temporary Chat pages when an old content script is detected.
 
 ## Supported services
 
@@ -25,6 +25,30 @@ ChatFolio is a Chrome extension for exporting ChatGPT, Claude, and Gemini conver
 - **ChatGPT data-first:** first attempts to read the selected conversation branch using ChatGPT's existing authenticated, first-party interface. This route can be unavailable for temporary conversations.
 - **Semantic DOM fallback:** traverses the browser's chat DOM, resolves authored messages/media, and preserves text selectability.
 - **Assisted Visual Backup:** a separate user-selected mode for cases in which semantic extraction is unavailable. It captures visible screens as an image-based archive while you scroll manually. A failed normal export now shows an error instead of opening this mode unexpectedly.
+
+## What is new in 1.8.11 (Gemini PDF white-space / pagination)
+
+- Allow long, text-only opening fragments in Gemini replies to span printable pages rather than moving a whole paragraph to the next page.
+- Retain author labels with the first actual lines, while leaving short openings, tables, images, and other platforms unchanged.
+- Verified with synthetic Chrome/PDF fixtures and a real 8-message Gemini export; the final output retains the uploaded screenshot and uses the formerly empty first-page space.
+
+## Fixes in 1.8.10 (Gemini off-screen image capture)
+
+- For protected Gemini uploads on `googleusercontent.com`, prefer capturing the image displayed in the authenticated browser tab instead of re-fetching an inaccessible redirect from `chrome-extension://` and raising a CORS error.
+- If Gemini's history scan has scrolled past an uploaded photo, temporarily scroll that *image* into view, wait for lazy-load, capture only its rectangle, and restore all original scroll positions in `finally`.
+- Preserve Claude's already-working upload embedding and ChatGPT's scanner/Stop/print implementation unchanged.
+- Retain explicit failure if an image cannot actually be captured; no silent missing uploads.
+- New Chromium fixtures verify both nested and adjacent off-screen Googleusercontent uploads, crop pixel colors, no duplicate media, no additional fetches, and exact scroll restoration. **Live Gemini upload confirmation completed in version 1.8.11.**
+
+## Fixes in 1.8.9 (Claude / Gemini user images)
+
+- Preserve uploaded photos and screenshots when Claude or Gemini renders them in adjacent sibling containers instead of inside the authored text element. This also supports `<canvas>` and visible CSS background image previews.
+- Embed image bytes directly in the printable document: first try the live provider resource, then the existing extension-origin provider-media fetch, then a tightly cropped `captureVisibleTab` of a fully visible loaded picture when browser protections prevent re-fetching.
+- Avoid copying the entire conversation as a screenshot; cropped image fallback covers only the picture bounds. Do not count broken-image icons as captured media.
+- If an identified user image still cannot be embedded, stop semantic export with an explicit warning instead of silently producing an incomplete PDF. The user may retry while the image is visible or choose Visual Backup manually.
+- Preserve ChatGPT's prior image-embedding route, scanner, Stop controls, print styles, and page layout.
+
+**Validation status:** synthetic Chromium fixtures verify Claude and Gemini in-message/sibling images, capture fallback and a real generated PDF with an embedded 640 × 360 image. Real user-image exports have also been verified on Claude and Gemini; providers can change their pages later.
 
 ## Fixes in 1.8.8
 
@@ -48,7 +72,7 @@ ChatFolio is a Chrome extension for exporting ChatGPT, Claude, and Gemini conver
 - Probes both positive and negative directions before rejecting a candidate scrollport.
 - If scanning is still blocked, reports probe offsets and message movement without including chat text.
 - Stops automatic tab refresh on update for Temporary Chat pages.
-- The reverse-scroll fix has been validated on a real ChatGPT Temporary Chat (16 exported turns), but provider interfaces may still change.
+- Subsequent live ChatGPT exports validated this scrolling fix.
 
 ## Fixes carried forward from 1.8.4
 

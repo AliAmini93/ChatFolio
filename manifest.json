@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatFolio - AI Chat to PDF",
-  "version": "1.8.8",
+  "version": "1.8.11",
   "description": "Export ChatGPT, Claude, and Gemini conversations to PDF with fast semantic extraction and an assisted layout-independent visual backup.",
   "permissions": [
     "activeTab",
