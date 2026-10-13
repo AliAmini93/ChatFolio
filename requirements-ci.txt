@@ -1,4 +1,4 @@
 # Pin browser/PDF dependencies for repeatable synthetic regression execution.
 playwright==1.57.0
 PyMuPDF==1.26.7
-Pillow==12.3.0
+Pillow==11.3.0

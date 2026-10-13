@@ -92,3 +92,21 @@ For an existing Ubuntu Python environment, activate its `bin/activate` script
 before `npm test`; `scripts/test.py` runs each browser test with that same Python
 interpreter (`sys.executable`). Set `CHATFOLIO_CHROMIUM=/usr/bin/chromium` if
 Playwright-managed Chromium is not installed in that environment.
+
+## Phase 3B3: Gemini history scanner
+
+The source of truth for Gemini's lazy history loading, turn counting, message
+capture and incomplete-export guard is now
+`src/providers/gemini/history-scanner.js`. Do not reintroduce this logic into
+`src/content/main.js`: it instantiates the injected factory while retaining
+export session lifecycle, scroll restoration and printing. After editing,
+run `npm run bundle && npm run check && npm test && npm run build`.
+See [ADR 0003B3](architecture/0003b3-gemini-history-scanner.md).
+
+On an Ubuntu workstation with Google Chrome installed, point Playwright at its
+executable (e.g. `CHATFOLIO_CHROMIUM=/usr/bin/google-chrome-stable`) rather than
+installing another Chromium. `scripts/test.py` uses the Python interpreter that
+invokes it. For a custom pre-existing virtual environment, run
+`"$PY" scripts/test.py` with `PY` set to that environment's `bin/python3`.
+The CI requirements pin Pillow 11.3.0 so installing them does not introduce the
+known `moviepy 2.2.1` vs Pillow 12.x incompatibility in a shared Python venv.

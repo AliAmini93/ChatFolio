@@ -151,3 +151,10 @@ share, and attachment URL requests in `src/providers/chatgpt/transport.js`.
 This is a structural change; the published Stable release remains v1.8.11.
 No provider permissions or export UI were changed. See
 `docs/architecture/0003b2-chatgpt-transport.md` for compatibility boundaries.
+
+### Engineering refactor milestone — Gemini history scanner (Phase 3B3)
+
+Gemini's scroll-to-load history collection and message completeness checks are
+isolated in `src/providers/gemini/history-scanner.js`. The generated Chrome
+content script remains classic MV3, and the user-facing release stays
+`v1.8.11`. See [ADR 0003B3](docs/architecture/0003b3-gemini-history-scanner.md).

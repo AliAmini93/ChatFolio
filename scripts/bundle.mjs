@@ -67,9 +67,23 @@ if (source.split(transportMarker).length !== 2 ||
 }
 const embeddedTransport = transportSource.replace('export function createChatGPTTransport({', 'function createChatGPTTransport({')
   .split('\n').map(line => line ? `  ${line}` : '').join('\n');
+const geminiHistoryMarker = '  /* @chatfolio-gemini-history */';
+const geminiHistorySource = readFileSync(join(root, 'src/providers/gemini/history-scanner.js'), 'utf8').trimEnd();
+const geminiHistoryDeclaration = 'export function createGeminiHistoryScanner({';
+if (source.split(geminiHistoryMarker).length !== 2 ||
+    !geminiHistorySource.includes(geminiHistoryDeclaration) ||
+    geminiHistorySource.split(geminiHistoryDeclaration).length !== 2 ||
+    (geminiHistorySource.match(/\bexport\s+function\b/g) ?? []).length !== 1 ||
+    /^\s*import\s/m.test(geminiHistorySource) ||
+    /\bexport\s+(?!function\s)/m.test(geminiHistorySource)) {
+  throw new Error('Gemini history scanner module or insertion marker has invalid structure');
+}
+const embeddedGeminiHistory = geminiHistorySource.replace(geminiHistoryDeclaration, 'function createGeminiHistoryScanner({')
+  .split('\n').map(line => line ? `  ${line}` : '').join('\n');
 const generated = source.replace(marker, definitions.join('\n\n'))
   .replace(metadataMarker, `  // BEGIN GENERATED ChatGPT metadata parsers\n${embeddedMetadata}\n  // END GENERATED ChatGPT metadata parsers`)
-  .replace(transportMarker, `  // BEGIN GENERATED ChatGPT transport\n${embeddedTransport}\n  // END GENERATED ChatGPT transport`);
+  .replace(transportMarker, `  // BEGIN GENERATED ChatGPT transport\n${embeddedTransport}\n  // END GENERATED ChatGPT transport`)
+  .replace(geminiHistoryMarker, `  // BEGIN GENERATED Gemini history scanner\n${embeddedGeminiHistory}\n  // END GENERATED Gemini history scanner`);
 const dest = join(root, 'content.js');
 if (process.argv.includes('--write')) {
   writeFileSync(dest, generated, 'utf8');
