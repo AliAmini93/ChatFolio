@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import json,time
@@ -26,7 +27,7 @@ real.addEventListener('scroll',draw,{passive:true});draw();
 </script></body></html>'''
 results=[]
 with sync_playwright() as p:
- b=p.chromium.launch(headless=True,executable_path='/usr/bin/chromium',args=['--no-sandbox','--disable-dev-shm-usage'],timeout=15000)
+ b=p.chromium.launch(headless=True,executable_path=os.environ.get('CHATFOLIO_CHROMIUM') or None,args=['--no-sandbox','--disable-dev-shm-usage'],timeout=15000)
  page=b.new_page(viewport={'width':1280,'height':900})
  page.set_content(html,wait_until='domcontentloaded')
  page.evaluate('''window.chrome={runtime:{getManifest:()=>({version:'1.8.5'}),onMessage:{addListener:()=>{}},sendMessage:async()=>({})}}''')

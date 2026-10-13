@@ -18,7 +18,7 @@ photo='data:image/png;base64,'+base64.b64encode(buf.getvalue()).decode()
 logo='data:image/svg+xml,'+quote('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="#208c69"/></svg>')
 
 with sync_playwright() as p:
-    browser=p.chromium.launch(headless=True,executable_path='/usr/bin/chromium',args=['--no-sandbox','--disable-dev-shm-usage'])
+    browser=p.chromium.launch(headless=True,executable_path=os.environ.get('CHATFOLIO_CHROMIUM') or None,args=['--no-sandbox','--disable-dev-shm-usage'])
     page=browser.new_page(viewport={'width':1200,'height':920})
     page.set_content('<html><body>Fixture</body></html>')
     page.evaluate('''window.chrome={runtime:{getManifest:()=>({version:"1.8.8"}),onMessage:{addListener:()=>{}},sendMessage:async()=>({})}}''')

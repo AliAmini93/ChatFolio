@@ -66,7 +66,7 @@ def test_one(browser,source,label):
     pdf.close();page.close();return stats
 
 with sync_playwright() as p:
- browser=p.chromium.launch(headless=True,executable_path='/usr/bin/chromium', args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu'])
+ browser=p.chromium.launch(headless=True,executable_path=os.environ.get('CHATFOLIO_CHROMIUM') or None, args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu'])
  current_source=new.read_text()
  # Control reproduces the provider CSS leak by omitting only the new class/data normalization.
  control_source=current_source.replace('      removeProviderPresentationHooks(node);','      // normalization intentionally disabled in control fixture;')

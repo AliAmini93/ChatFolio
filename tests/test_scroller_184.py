@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import time,json
@@ -25,7 +26,7 @@ results=[]
 def add(name,pass_,detail):
  results.append({'test':name,'passed':bool(pass_),'detail':detail})
 with sync_playwright() as p:
- b=p.chromium.launch(headless=True,executable_path='/usr/bin/chromium',args=['--no-sandbox','--disable-dev-shm-usage'],timeout=15000)
+ b=p.chromium.launch(headless=True,executable_path=os.environ.get('CHATFOLIO_CHROMIUM') or None,args=['--no-sandbox','--disable-dev-shm-usage'],timeout=15000)
  def open_page(content,code=source):
   page=b.new_page(viewport={'width':1280,'height':900})
   page.set_content(content,wait_until='domcontentloaded')

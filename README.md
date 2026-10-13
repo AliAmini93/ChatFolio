@@ -108,3 +108,16 @@ If Python and Playwright are installed, run `python tests/test_negative_scroll_1
 ChatFolio has no backend storing your chats. Its browser-side extraction may request first-party provider metadata, media and font resources as needed. See [PRIVACY.md](PRIVACY.md).
 
 Licensed under MIT; see [LICENSE](LICENSE). ChatGPT, Claude, and Gemini are trademarks of their respective owners. ChatFolio is not affiliated with or endorsed by OpenAI, Anthropic or Google.
+
+## Developing ChatFolio
+
+The stable v1.8.11 runtime is currently preserved while the development
+infrastructure is modernized in small, reviewable steps. See
+[Development and testing](docs/development.md),
+[Contributing](CONTRIBUTING.md), and
+[Architecture decision 0001](docs/architecture/0001-baseline-and-ci.md).
+
+Developer commands: `npm run check` validates syntax and manifest assets,
+`npm test` runs the Chromium regression fixtures, and `npm run build` makes the
+Chrome ZIP from an explicit allowlist. GitHub Actions runs these for pull
+requests. This does **not** replace real-session smoke testing on provider sites.

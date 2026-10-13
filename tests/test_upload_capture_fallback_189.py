@@ -1,3 +1,4 @@
+import os
 """Validate capture fallback for loaded, CORS-blocked attachment thumbnails."""
 from pathlib import Path
 from playwright.sync_api import sync_playwright
@@ -15,7 +16,7 @@ raw_png = image_buffer.getvalue()
 report = []
 
 with sync_playwright() as p:
-  browser = p.chromium.launch(headless=True, executable_path='/usr/bin/chromium', args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'])
+  browser = p.chromium.launch(headless=True, executable_path=os.environ.get('CHATFOLIO_CHROMIUM') or None, args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'])
   for platform in ['claude','gemini']:
     page = browser.new_page(viewport={'width':1000,'height':750}, device_scale_factor=1)
     # This URL is an offline Playwright fixture. fetch() cannot read its pixels
