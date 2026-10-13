@@ -36,3 +36,13 @@ and distributable ZIP use the generated runtime, not a parallel implementation.
 These remain in `src/content/main.js` until they can be migrated behind stable
 provider-level boundaries without regressing full-chat coverage. Moving the
 DOM adapters does **not** yet mean the entire 6,500-line controller was split.
+
+## ChatGPT metadata parser — phase 3B1
+
+The pure parsing and tree-ordering part of ChatGPT's data-first path now lives in
+`chatgpt/metadata-parser.js`; these eight named ESM exports are embedded verbatim
+as local declarations in `content.js` by `scripts/bundle.mjs` (see ADR 0003B1).
+Run `npm run bundle`, then `npm run check` and `npm test` after modifications.
+Authenticated fetches and the remaining scanner/network orchestration are still
+in the main controller pending phase 3B2/3B3. Do not introduce network calls or
+persistent access-token storage into the parser module.
