@@ -140,3 +140,22 @@ CHATFOLIO_CHROMIUM=/usr/bin/google-chrome-stable "$PY" scripts/test.py
 ```
 
 No Playwright-managed Chromium download is needed with this command.
+
+## Phase 4B2: turn-media functions
+
+Live image/canvas conversion, image-pair accounting, image classification and
+attachment chip handling live in `src/media/turn-media.js`. The content
+controller still chooses the serialization order. Modify the module, never
+the generated `content.js` directly, then run:
+
+```sh
+npm run bundle
+npm run check
+npm run test:core
+CHATFOLIO_CHROMIUM=/usr/bin/google-chrome-stable python3 scripts/test.py
+npm run build
+```
+
+For deterministic before/after compatibility checks, use the previous phase's
+`content.js` path as `CHATFOLIO_BASELINE_CONTENT` when running
+`tests/test_turn_media_phase4b2.py`. Keep real user images out of fixtures.

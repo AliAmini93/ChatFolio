@@ -110,12 +110,27 @@ if (source.split(mediaMarker).length !== 2 ||
   throw new Error('Image pipeline factory or insertion marker has invalid structure');
 }
 const embeddedMedia = mediaSource.replace(mediaDeclaration, 'function createImagePipeline({');
+// Phase 4B2: image pairs, canvas snapshots and attachment preservation remain
+// pure media preparation (not print layout). Embed the legacy function bodies
+// without new indentation or source rewriting in the MV3 isolated script.
+const turnMediaMarker = '  /* @chatfolio-turn-media */';
+const turnMediaSource = readFileSync(join(root, 'src/media/turn-media.js'), 'utf8').trimEnd();
+const turnMediaDeclaration = 'export function createTurnMediaProcessor({';
+if (source.split(turnMediaMarker).length !== 2 ||
+    turnMediaSource.split(turnMediaDeclaration).length !== 2 ||
+    (turnMediaSource.match(/\bexport\s+function\b/g) ?? []).length !== 1 ||
+    /^\s*import\s/m.test(turnMediaSource) ||
+    /\bexport\s+(?!function\s)/m.test(turnMediaSource)) {
+  throw new Error('Turn media module factory or insertion marker has invalid structure');
+}
+const embeddedTurnMedia = turnMediaSource.replace(turnMediaDeclaration, 'function createTurnMediaProcessor({');
 const generated = source.replace(marker, definitions.join('\n\n'))
   .replace(metadataMarker, `  // BEGIN GENERATED ChatGPT metadata parsers\n${embeddedMetadata}\n  // END GENERATED ChatGPT metadata parsers`)
   .replace(transportMarker, `  // BEGIN GENERATED ChatGPT transport\n${embeddedTransport}\n  // END GENERATED ChatGPT transport`)
   .replace(geminiHistoryMarker, `  // BEGIN GENERATED Gemini history scanner\n${embeddedGeminiHistory}\n  // END GENERATED Gemini history scanner`)
   .replace(pdfRendererMarker, `  // BEGIN GENERATED PDF document renderer\n${embeddedPdfRenderer}\n  // END GENERATED PDF document renderer`)
-  .replace(mediaMarker, `  // BEGIN GENERATED Image pipeline\n${embeddedMedia}\n  // END GENERATED Image pipeline`);
+  .replace(mediaMarker, `  // BEGIN GENERATED Image pipeline\n${embeddedMedia}\n  // END GENERATED Image pipeline`)
+  .replace(turnMediaMarker, `  // BEGIN GENERATED turn media\n${embeddedTurnMedia}\n  // END GENERATED turn media`);
 const dest = join(root, 'content.js');
 if (process.argv.includes('--write')) {
   writeFileSync(dest, generated, 'utf8');
