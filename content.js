@@ -5245,6 +5245,20 @@
     return `${clean}, ${fallback}`;
   }
 
+  // BEGIN GENERATED PDF document renderer
+/**
+ * Provider-neutral A4/RTL printable document renderer.
+ *
+ * The factory declares its outside dependencies so the ESM source is testable
+ * in isolation, while the transitional MV3 generator can embed it inside the
+ * existing single classic content script without adding Chrome permissions.
+ *
+ * Message HTML must be sanitized by the extraction boundary before arrival.
+ * This renderer preserves legacy markup rather than attempting sanitization.
+ */
+function createPdfDocumentRenderer({
+  document, Node, Element, escapeHtml, mergeFontStacks, inferDirection
+}) {
   function splitPrintableMessageOpening(html) {
     // Keep the role badge and the FIRST authored content unit in one unbreakable
     // print fragment. break-after:avoid on the badge alone fails when ChatGPT
@@ -6215,6 +6229,18 @@
 
     return { lang, dir, uiLocale, script };
   }
+
+  return Object.freeze({
+    buildPrintableDocument,
+    splitPrintableMessageOpening,
+    groupMessagesIntoExchanges,
+    detectDocumentProfile
+  });
+}
+  // END GENERATED PDF document renderer
+  const { buildPrintableDocument, splitPrintableMessageOpening, groupMessagesIntoExchanges, detectDocumentProfile } = createPdfDocumentRenderer({
+    document, Node, Element, escapeHtml, mergeFontStacks, inferDirection
+  });
 
   function collectDomDiagnostics() {
     try {

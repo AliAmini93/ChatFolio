@@ -110,3 +110,16 @@ invokes it. For a custom pre-existing virtual environment, run
 `"$PY" scripts/test.py` with `PY` set to that environment's `bin/python3`.
 The CI requirements pin Pillow 11.3.0 so installing them does not introduce the
 known `moviepy 2.2.1` vs Pillow 12.x incompatibility in a shared Python venv.
+
+## Phase 4A: provider-neutral PDF document generation
+
+The source of truth for A4 document HTML, page CSS, paragraph splitting,
+message grouping and document-language direction is now
+`src/renderer/pdf-document.js`. Modify that module, **not** generated
+`content.js`, then run `npm run bundle && npm run check && npm run test:core`.
+The one-export ESM factory is bundled into the classic MV3 script without
+re-indenting its HTML/CSS template. Browser/PDF regression
+`tests/test_pdf_renderer_phase4a.py` checks identical generated/ESM output
+for ChatGPT/English, Gemini/Persian and Claude/image fixtures; run it with the
+same Python/Chrome setup as existing tests. Media extraction and print delivery
+have not moved yet. See [ADR 0004A](architecture/0004a-pdf-document-renderer.md).
