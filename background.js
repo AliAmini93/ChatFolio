@@ -1,5 +1,8 @@
 const STORAGE_KEY = "chatfolioActiveExport";
 const printJobs = new Map();
+const MAX_ACTIVE_PRINT_JOBS = 3;
+const MAX_PRINT_CHUNK_CHARS = 1024 * 1024;
+const MAX_PRINT_JOB_CHARS = 128 * 1024 * 1024;
 let memoryActiveExport = null;
 
 
@@ -144,6 +147,35 @@ chrome.runtime.onConnect.addListener((port) => {
 
 
 const remoteResourceCache = new Map();
+const REMOTE_CACHE_MAX_ENTRIES = 8;
+const REMOTE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+function cachedRemoteResource(key) {
+  const entry = remoteResourceCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.createdAt >= REMOTE_CACHE_TTL_MS) {
+    remoteResourceCache.delete(key);
+    return null;
+  }
+  remoteResourceCache.delete(key);
+  remoteResourceCache.set(key, entry);
+  return entry.promise;
+}
+
+function rememberRemoteResource(key, promise) {
+  const now = Date.now();
+  for (const [cachedKey, entry] of remoteResourceCache) {
+    if (now - entry.createdAt >= REMOTE_CACHE_TTL_MS) remoteResourceCache.delete(cachedKey);
+  }
+  remoteResourceCache.set(key, { promise, createdAt: now });
+  while (remoteResourceCache.size > REMOTE_CACHE_MAX_ENTRIES) {
+    remoteResourceCache.delete(remoteResourceCache.keys().next().value);
+  }
+}
+
+function forgetFailedRemoteResource(key, promise) {
+  if (remoteResourceCache.get(key)?.promise === promise) remoteResourceCache.delete(key);
+}
 
 function isAllowedProviderResourceUrl(rawUrl) {
   try {
@@ -171,7 +203,8 @@ function bytesToBase64(bytes) {
 
 async function fetchRemoteText(url) {
   const key = `text:${url}`;
-  if (remoteResourceCache.has(key)) return remoteResourceCache.get(key);
+  const cached = cachedRemoteResource(key);
+  if (cached) return cached;
   const promise = (async () => {
     if (!isAllowedProviderResourceUrl(url)) throw new Error("Resource host is not allowed.");
     const response = await fetch(url, { cache: "force-cache", credentials: "omit", redirect: "follow" });
@@ -182,13 +215,14 @@ async function fetchRemoteText(url) {
     if (text.length > 2 * 1024 * 1024) throw new Error("Stylesheet is too large.");
     return text;
   })();
-  remoteResourceCache.set(key, promise);
-  try { return await promise; } catch (error) { remoteResourceCache.delete(key); throw error; }
+  rememberRemoteResource(key, promise);
+  try { return await promise; } catch (error) { forgetFailedRemoteResource(key, promise); throw error; }
 }
 
 async function fetchRemoteDataUrl(url) {
   const key = `data:${url}`;
-  if (remoteResourceCache.has(key)) return remoteResourceCache.get(key);
+  const cached = cachedRemoteResource(key);
+  if (cached) return cached;
   const promise = (async () => {
     if (!isAllowedProviderResourceUrl(url)) throw new Error("Resource host is not allowed.");
     const response = await fetch(url, { cache: "force-cache", credentials: "omit", redirect: "follow" });
@@ -201,8 +235,8 @@ async function fetchRemoteDataUrl(url) {
     if (buffer.byteLength > maxBytes) throw new Error("Remote resource is too large.");
     return `data:${mime};base64,${bytesToBase64(new Uint8Array(buffer))}`;
   })();
-  remoteResourceCache.set(key, promise);
-  try { return await promise; } catch (error) { remoteResourceCache.delete(key); throw error; }
+  rememberRemoteResource(key, promise);
+  try { return await promise; } catch (error) { forgetFailedRemoteResource(key, promise); throw error; }
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -258,6 +292,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
+    if (printJobs.has(jobId)) {
+      sendResponse({ ok: false, error: "A print job with this identifier already exists." });
+      return;
+    }
+    if (printJobs.size >= MAX_ACTIVE_PRINT_JOBS) {
+      sendResponse({ ok: false, error: "Too many print jobs are open. Close an old print view and try again." });
+      return;
+    }
+
     const job = {
       id: jobId,
       title: String(message.title || "ChatFolio conversation"),
@@ -267,6 +310,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       totalChunks,
       chunks: new Array(totalChunks),
       receivedChunks: 0,
+      receivedChars: 0,
       sentChunks: 0,
       complete: false,
       endSent: false,
@@ -300,7 +344,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, error: "Invalid print data chunk." });
       return;
     }
-    if (typeof job.chunks[index] !== "string") job.receivedChunks += 1;
+    if (message.data.length > MAX_PRINT_CHUNK_CHARS) {
+      sendResponse({ ok: false, error: "Print data chunk exceeds the supported size." });
+      return;
+    }
+    const previous = typeof job.chunks[index] === "string" ? job.chunks[index] : null;
+    const receivedChars = job.receivedChars - (previous?.length || 0) + message.data.length;
+    if (receivedChars > MAX_PRINT_JOB_CHARS) {
+      cleanupPrintJob(job.id, { closeTab: true });
+      sendResponse({ ok: false, error: "Print job exceeds the safe memory limit. Try a smaller archive." });
+      return;
+    }
+    if (previous === null) job.receivedChunks += 1;
+    job.receivedChars = receivedChars;
     job.chunks[index] = message.data;
     flushPrintJob(job);
     sendResponse({ ok: true });
