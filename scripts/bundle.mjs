@@ -80,10 +80,28 @@ if (source.split(geminiHistoryMarker).length !== 2 ||
 }
 const embeddedGeminiHistory = geminiHistorySource.replace(geminiHistoryDeclaration, 'function createGeminiHistoryScanner({')
   .split('\n').map(line => line ? `  ${line}` : '').join('\n');
+// Phase 4A: PDF construction is provider-independent and exports one factory.
+// Preserve the original renderer implementation verbatim in the classic MV3
+// script; do not require ESM syntax at injection time.
+const pdfRendererMarker = '  /* @chatfolio-pdf-document-renderer */';
+const pdfRendererSource = readFileSync(join(root, 'src/renderer/pdf-document.js'), 'utf8').trimEnd();
+const pdfRendererDeclaration = 'export function createPdfDocumentRenderer({';
+if (source.split(pdfRendererMarker).length !== 2 ||
+    !pdfRendererSource.includes(pdfRendererDeclaration) ||
+    pdfRendererSource.split(pdfRendererDeclaration).length !== 2 ||
+    (pdfRendererSource.match(/\bexport\s+function\b/g) ?? []).length !== 1 ||
+    /^\s*import\s/m.test(pdfRendererSource) ||
+    /\bexport\s+(?!function\s)/m.test(pdfRendererSource)) {
+  throw new Error('PDF renderer module or insertion marker has invalid structure');
+}
+// Do not re-indent: this module contains a large HTML/CSS template literal.
+// Prefixing lines would alter printable HTML whitespace and risk pagination.
+const embeddedPdfRenderer = pdfRendererSource.replace(pdfRendererDeclaration, 'function createPdfDocumentRenderer({');
 const generated = source.replace(marker, definitions.join('\n\n'))
   .replace(metadataMarker, `  // BEGIN GENERATED ChatGPT metadata parsers\n${embeddedMetadata}\n  // END GENERATED ChatGPT metadata parsers`)
   .replace(transportMarker, `  // BEGIN GENERATED ChatGPT transport\n${embeddedTransport}\n  // END GENERATED ChatGPT transport`)
-  .replace(geminiHistoryMarker, `  // BEGIN GENERATED Gemini history scanner\n${embeddedGeminiHistory}\n  // END GENERATED Gemini history scanner`);
+  .replace(geminiHistoryMarker, `  // BEGIN GENERATED Gemini history scanner\n${embeddedGeminiHistory}\n  // END GENERATED Gemini history scanner`)
+  .replace(pdfRendererMarker, `  // BEGIN GENERATED PDF document renderer\n${embeddedPdfRenderer}\n  // END GENERATED PDF document renderer`);
 const dest = join(root, 'content.js');
 if (process.argv.includes('--write')) {
   writeFileSync(dest, generated, 'utf8');

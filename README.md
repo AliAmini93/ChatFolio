@@ -158,3 +158,12 @@ Gemini's scroll-to-load history collection and message completeness checks are
 isolated in `src/providers/gemini/history-scanner.js`. The generated Chrome
 content script remains classic MV3, and the user-facing release stays
 `v1.8.11`. See [ADR 0003B3](docs/architecture/0003b3-gemini-history-scanner.md).
+
+### Engineering refactor milestone — PDF renderer (Phase 4A)
+
+Provider-neutral printable HTML and A4 CSS are now in
+`src/renderer/pdf-document.js`; the production MV3 `content.js` is generated
+from this ESM module and the existing provider adapters. This is an internal
+structural change, not a published extension update. The media-capture pipeline
+is unchanged pending phase 4B. See
+[ADR 0004A](docs/architecture/0004a-pdf-document-renderer.md).
