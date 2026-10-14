@@ -174,3 +174,9 @@ The live user-image capture/fetch pipeline was isolated into
 `src/media/image-pipeline.js` while the extension remains a single classic
 MV3 content script at runtime. See `docs/architecture/0004b1-image-pipeline.md`.
 This is an internal refactor, **not** a new stable extension release.
+
+**Architecture progress — Phase 4B2:** Canvas snapshots, per-turn image
+classification/embedding and non-image attachment chips are isolated in
+`src/media/turn-media.js`, while the clone/cleanup ordering stays in the
+content orchestrator. See `docs/architecture/0004b2-turn-media-preparation.md`.
+This is an internal refactor, not a new public extension release.

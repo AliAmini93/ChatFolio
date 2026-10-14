@@ -24,3 +24,22 @@ canvas/media UI markup transformation, response-image classification, font
 embedding, and print delivery remain in `src/content/main.js` or the Renderer.
 Those can be moved in separate small PRs. The module itself is not a complete
 media serializer and does not sanitize external HTML.
+
+## Phase 4B2 — authored-turn media preparation
+
+`turn-media.js` owns canvas-to-image conversion, source/clone image-pair embedding,
+rendered-size and citation-logo classification, media-button retention, and
+Gemini sibling attachment chips. Its factory is dependency-injected and is
+embedded in the same MV3 classic content script as the existing `image-pipeline.js`.
+
+`serializeTurn` remains responsible for the overall clone/sanitization sequence:
+prune hidden subtrees, then canvas conversion, preserve authored content and
+file wrappers, embed matched images, strip provider chrome, append sibling
+user images, sanitize HTML and validate that no required upload is missing.
+Do **not** move the image-pair pass before the attachment wrappers or move
+provider cleanup before DOM source/clone pairing; that can lose or mismatch
+uploaded media. Do not treat unreadable user canvases as successful uploads.
+
+The media statistics returned by both factory methods are additive and preserve
+`imageCount`, `embeddedImageCount`, `missingUserImages` and `mediaKeys` semantics.
+Unit tests and Chromium's generated-runtime parity test enforce this contract.
