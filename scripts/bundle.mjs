@@ -97,11 +97,25 @@ if (source.split(pdfRendererMarker).length !== 2 ||
 // Do not re-indent: this module contains a large HTML/CSS template literal.
 // Prefixing lines would alter printable HTML whitespace and risk pagination.
 const embeddedPdfRenderer = pdfRendererSource.replace(pdfRendererDeclaration, 'function createPdfDocumentRenderer({');
+// Phase 4B1: copy provider image/media extraction as an isolated source
+// factory into the classic MV3 script without changing its helper bodies.
+const mediaMarker = '  /* @chatfolio-image-pipeline */';
+const mediaSource = readFileSync(join(root, 'src/media/image-pipeline.js'), 'utf8').trimEnd();
+const mediaDeclaration = 'export function createImagePipeline({';
+if (source.split(mediaMarker).length !== 2 ||
+    mediaSource.split(mediaDeclaration).length !== 2 ||
+    (mediaSource.match(/\bexport\s+function\b/g) ?? []).length !== 1 ||
+    /^\s*import\s/m.test(mediaSource) ||
+    /\bexport\s+(?!function\s)/m.test(mediaSource)) {
+  throw new Error('Image pipeline factory or insertion marker has invalid structure');
+}
+const embeddedMedia = mediaSource.replace(mediaDeclaration, 'function createImagePipeline({');
 const generated = source.replace(marker, definitions.join('\n\n'))
   .replace(metadataMarker, `  // BEGIN GENERATED ChatGPT metadata parsers\n${embeddedMetadata}\n  // END GENERATED ChatGPT metadata parsers`)
   .replace(transportMarker, `  // BEGIN GENERATED ChatGPT transport\n${embeddedTransport}\n  // END GENERATED ChatGPT transport`)
   .replace(geminiHistoryMarker, `  // BEGIN GENERATED Gemini history scanner\n${embeddedGeminiHistory}\n  // END GENERATED Gemini history scanner`)
-  .replace(pdfRendererMarker, `  // BEGIN GENERATED PDF document renderer\n${embeddedPdfRenderer}\n  // END GENERATED PDF document renderer`);
+  .replace(pdfRendererMarker, `  // BEGIN GENERATED PDF document renderer\n${embeddedPdfRenderer}\n  // END GENERATED PDF document renderer`)
+  .replace(mediaMarker, `  // BEGIN GENERATED Image pipeline\n${embeddedMedia}\n  // END GENERATED Image pipeline`);
 const dest = join(root, 'content.js');
 if (process.argv.includes('--write')) {
   writeFileSync(dest, generated, 'utf8');

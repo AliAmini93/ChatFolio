@@ -167,3 +167,10 @@ from this ESM module and the existing provider adapters. This is an internal
 structural change, not a published extension update. The media-capture pipeline
 is unchanged pending phase 4B. See
 [ADR 0004A](docs/architecture/0004a-pdf-document-renderer.md).
+
+### Engineering refactor: phase 4B1
+
+The live user-image capture/fetch pipeline was isolated into
+`src/media/image-pipeline.js` while the extension remains a single classic
+MV3 content script at runtime. See `docs/architecture/0004b1-image-pipeline.md`.
+This is an internal refactor, **not** a new stable extension release.

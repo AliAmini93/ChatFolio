@@ -123,3 +123,20 @@ re-indenting its HTML/CSS template. Browser/PDF regression
 for ChatGPT/English, Gemini/Persian and Claude/image fixtures; run it with the
 same Python/Chrome setup as existing tests. Media extraction and print delivery
 have not moved yet. See [ADR 0004A](architecture/0004a-pdf-document-renderer.md).
+
+## Phase 4B1: image pipeline
+
+`src/media/image-pipeline.js` owns live attachment URL detection, bounded
+image fetch-to-data conversion, and viewport screenshot fallbacks. The
+content script injects its browser dependencies and remains classic MV3.
+Keep the image and PDF regression fixtures green before changing its helpers.
+See `docs/architecture/0004b1-image-pipeline.md`.
+
+For Ubuntu's existing HCI venv and installed Google Chrome, run:
+
+```sh
+PY="/mnt/HDD/AliWorks/HCI Tagging Database/HCI/bin/python3"
+CHATFOLIO_CHROMIUM=/usr/bin/google-chrome-stable "$PY" scripts/test.py
+```
+
+No Playwright-managed Chromium download is needed with this command.
