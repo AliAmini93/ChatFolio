@@ -33,14 +33,14 @@ with sync_playwright() as p:
     page.set_content('<!doctype html><html><body></body></html>')
     page.evaluate('window.chrome={runtime:{getManifest:()=>({version:"1.8.11"}),onMessage:{addListener:()=>{}},sendMessage:async()=>({})}}')
     script=RUNTIME.replace('const PLATFORM = detectPlatform();', 'const PLATFORM = {id:"chatgpt",name:"ChatGPT",assistantLabel:"ChatGPT"};',1)
-    script=script.rsplit('})();',1)[0]+'window.__phase4a={buildPrintableDocument,escapeHtml,mergeFontStacks,inferDirection};})();'
+    script=script.rsplit('})();',1)[0]+'window.__phase4a={buildPrintableDocument,escapeHtml,mergeFontStacks,inferDirection,sanitizePrintClone};})();'
     page.add_script_tag(content=script)
     # The same data/typed dependencies, all running in Chromium's DOM.
     esm=MODULE.replace('export function createPdfDocumentRenderer(', 'function createPdfDocumentRenderer(',1)
     source_func=r"""(source, messages, title, platform) => {
-      const f=new Function('document','Node','Element','escapeHtml','mergeFontStacks','inferDirection',source+'\nreturn createPdfDocumentRenderer({document,Node,Element,escapeHtml,mergeFontStacks,inferDirection});');
+      const f=new Function('document','Node','Element','escapeHtml','mergeFontStacks','inferDirection','sanitizePrintClone',source+'\nreturn createPdfDocumentRenderer({document,Node,Element,escapeHtml,mergeFontStacks,inferDirection,sanitizePrintClone});');
       const deps=window.__phase4a;
-      return f(document,Node,Element,deps.escapeHtml,deps.mergeFontStacks,deps.inferDirection).buildPrintableDocument(messages,title,{layoutMode:'comfortable',showMessageNumbers:true,includeExportTime:false},messages.reduce((x,m)=>x+m.imageCount,0),platform);
+      return f(document,Node,Element,deps.escapeHtml,deps.mergeFontStacks,deps.inferDirection,deps.sanitizePrintClone).buildPrintableDocument(messages,title,{layoutMode:'comfortable',showMessageNumbers:true,includeExportTime:false},messages.reduce((x,m)=>x+m.imageCount,0),platform);
     }"""
     with tempfile.TemporaryDirectory(prefix='chatfolio4a-') as temp:
         for name,platform,title,messages in cases:

@@ -5544,12 +5544,36 @@ function createTurnMediaProcessor({
  * in isolation, while the transitional MV3 generator can embed it inside the
  * existing single classic content script without adding Chrome permissions.
  *
- * Message HTML must be sanitized by the extraction boundary before arrival.
- * This renderer preserves legacy markup rather than attempting sanitization.
+ * Defense in depth: the renderer sanitizes every incoming message fragment
+ * before layout, even if a non-DOM extraction route bypassed serializeTurn().
  */
 function createPdfDocumentRenderer({
-  document, Node, Element, escapeHtml, mergeFontStacks, inferDirection
+  document, Node, Element, escapeHtml, mergeFontStacks, inferDirection,
+  sanitizePrintClone
 }) {
+  function sanitizeMessageHtml(html) {
+    // A template keeps parsed markup inert until after the allowlisted DOM
+    // sanitizer has removed scripts, event handlers, unsafe URL references and
+    // provider metadata. Never add raw incoming HTML to the printable document.
+    if (!document?.createElement || typeof sanitizePrintClone !== 'function') {
+      throw new Error('The PDF renderer requires an HTML sanitizer.');
+    }
+    const template = document.createElement('template');
+    template.innerHTML = String(html || '');
+    sanitizePrintClone(template.content);
+    return template.innerHTML;
+  }
+
+  function safePrintFontStack(value, fallback) {
+    const candidate = String(value || '').trim();
+    // CSS font-family grammar here deliberately admits only literal names and
+    // comma-separated fallback families, not var(), url(), brackets, braces,
+    // backslash escapes or arbitrary CSS declarations.
+    return candidate.length <= 380 &&
+      /^[\p{L}\p{N} .,'"_\-]+$/u.test(candidate)
+      ? candidate : fallback;
+  }
+
   function splitPrintableMessageOpening(html) {
     // Keep the role badge and the FIRST authored content unit in one unbreakable
     // print fragment. break-after:avoid on the badge alone fails when ChatGPT
@@ -5644,7 +5668,11 @@ function createPdfDocumentRenderer({
       timeStyle: "short"
     }).format(new Date());
 
-    const profile = detectDocumentProfile(messages);
+    const safeMessages = messages.map((message) => ({
+      ...message,
+      html: sanitizeMessageHtml(message.html)
+    }));
+    const profile = detectDocumentProfile(safeMessages);
     const language = profile.lang;
     const documentDir = profile.dir;
     const isRtlDocument = documentDir === "rtl";
@@ -5654,12 +5682,13 @@ function createPdfDocumentRenderer({
     const sourceBaseFont = sourceTypography?.base?.fontFamily || "";
     const sourceRtlFont = sourceTypography?.rtl?.fontFamily || sourceBaseFont;
     const sourceLtrFont = sourceTypography?.ltr?.fontFamily || sourceBaseFont;
-    const documentFontStack = mergeFontStacks(isRtlDocument ? sourceRtlFont : sourceLtrFont, systemUiStack);
-    const ltrFontStack = mergeFontStacks(sourceLtrFont, systemUiStack);
-    const rtlFontStack = mergeFontStacks(sourceRtlFont, systemUiStack);
-    const userCount = messages.filter((message) => message.role === "user").length;
-    const assistantCount = messages.filter((message) => message.role === "assistant").length;
-    const exchanges = groupMessagesIntoExchanges(messages);
+    const documentFontStack = safePrintFontStack(
+      mergeFontStacks(isRtlDocument ? sourceRtlFont : sourceLtrFont, systemUiStack), systemUiStack);
+    const ltrFontStack = safePrintFontStack(mergeFontStacks(sourceLtrFont, systemUiStack), systemUiStack);
+    const rtlFontStack = safePrintFontStack(mergeFontStacks(sourceRtlFont, systemUiStack), systemUiStack);
+    const userCount = safeMessages.filter((message) => message.role === "user").length;
+    const assistantCount = safeMessages.filter((message) => message.role === "assistant").length;
+    const exchanges = groupMessagesIntoExchanges(safeMessages);
 
     const assistantName = platform?.assistantLabel || platform?.name || "Assistant";
     const platformName = platform?.name || assistantName;
@@ -5746,7 +5775,9 @@ function createPdfDocumentRenderer({
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${escapeHtml(title)}</title>
   <style>
-    ${sourceTypography?.fontFaceCss || ""}
+    /* Provider font-family stacks are retained after validation. Untrusted
+       raw @font-face CSS must not be inserted into the report style element:
+       it could contain remote CSS imports, network URLs or HTML terminators. */
 
     @page {
       size: A4;
@@ -6530,7 +6561,8 @@ function createPdfDocumentRenderer({
 }
   // END GENERATED PDF document renderer
   const { buildPrintableDocument, splitPrintableMessageOpening, groupMessagesIntoExchanges, detectDocumentProfile } = createPdfDocumentRenderer({
-    document, Node, Element, escapeHtml, mergeFontStacks, inferDirection
+    document, Node, Element, escapeHtml, mergeFontStacks, inferDirection,
+    sanitizePrintClone
   });
 
   function collectDomDiagnostics() {
