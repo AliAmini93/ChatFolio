@@ -17,3 +17,17 @@ synthetic fixtures in tests instead.
 The current architecture is transitional: see
 [ADR 0001](docs/architecture/0001-baseline-and-ci.md). Do not bulk-format or
 reorganize `content.js` without an equivalence test and a narrowly scoped PR.
+
+## Release security and QA
+
+Every PR that affects runtime assets should pass the CI release gate:
+`npm run build && python3 scripts/release_gate.py`. This verifies
+manifest/package version alignment, the exact runtime allowlist, and
+byte-for-byte reproducibility. See
+[release process](docs/releases/release-process.md).
+
+A green CI or synthetic PDF fixture **does not** prove full live-provider
+conversation extraction. Do not label or publish a release candidate until
+real ChatGPT, Claude and Gemini results are explicitly recorded without any
+private conversation data. Report vulnerabilities privately per
+[SECURITY.md](SECURITY.md).
