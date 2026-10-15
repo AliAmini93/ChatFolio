@@ -78,25 +78,23 @@ with TemporaryDirectory(prefix="chatfolio-real-mv3-") as profile:
             assert source.locator("#exportBtn").count() == 1
 
             job_id = "phase-6a-real-runtime"
-            response = send(source, {
-                "type": "CHATFOLIO_PRINT_BEGIN",
-                "jobId": job_id,
-                "title": "Phase 6A real MV3 printable document",
-                "platform": "chatgpt",
-                "platformName": "ChatGPT",
-                "totalChunks": 2
-            })
+            # The background can answer chrome.tabs.create before Playwright
+            # has discovered the new target. Subscribe before sending BEGIN.
+            with context.expect_page(timeout=15000) as opened:
+                response = send(source, {
+                    "type": "CHATFOLIO_PRINT_BEGIN",
+                    "jobId": job_id,
+                    "title": "Phase 6A real MV3 printable document",
+                    "platform": "chatgpt",
+                    "platformName": "ChatGPT",
+                    "totalChunks": 2
+                })
             assert response["ok"] and isinstance(response["printTabId"], int), response
             print_url = (
                 f"chrome-extension://{extension_id}/print.html?job={job_id}"
             )
-            print_page = next(
-                (page for page in context.pages if page.url == print_url),
-                None,
-            )
-            assert print_page is not None, (
-                f"Real background did not open print tab: {[p.url for p in context.pages]}"
-            )
+            print_page = opened.value
+            print_page.wait_for_url(print_url, timeout=15000)
 
             # Deliberately send chunks out of order to verify the real MV3
             # worker/Port/iframe pipeline reassembles them by index.
