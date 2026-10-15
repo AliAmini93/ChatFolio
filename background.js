@@ -5,6 +5,83 @@ const MAX_PRINT_CHUNK_CHARS = 1024 * 1024;
 const MAX_PRINT_JOB_CHARS = 128 * 1024 * 1024;
 let memoryActiveExport = null;
 
+// Phase 5B1: complete print jobs survive a service-worker restart. The spool
+// never leaves this extension origin; incomplete transfers remain fail-closed.
+const PRINT_RECOVERY_DB = "chatfolio-print-recovery";
+const PRINT_RECOVERY_TTL_MS = 10 * 60 * 1000;
+let printRecoveryDbPromise = null;
+
+function openPrintRecoveryDb() {
+  if (typeof indexedDB === "undefined") return Promise.resolve(null);
+  if (!printRecoveryDbPromise) {
+    printRecoveryDbPromise = new Promise((resolve, reject) => {
+      const request = indexedDB.open(PRINT_RECOVERY_DB, 1);
+      request.onupgradeneeded = () => request.result.createObjectStore("completed", { keyPath: "id" });
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error("Print recovery storage is unavailable."));
+      request.onblocked = () => reject(new Error("Print recovery storage is blocked."));
+    }).catch((error) => {
+      printRecoveryDbPromise = null;
+      throw error;
+    });
+  }
+  return printRecoveryDbPromise;
+}
+
+async function storeCompletedPrintJob(job) {
+  const db = await openPrintRecoveryDb();
+  if (!db) return; // The legacy memory-only path remains usable in test runtimes.
+  const snapshot = {
+    id: job.id, title: job.title, platform: job.platform,
+    platformName: job.platformName, sourceTabId: job.sourceTabId,
+    printTabId: job.printTabId, totalChunks: job.totalChunks,
+    receivedChunks: job.receivedChunks, receivedChars: job.receivedChars,
+    createdAt: job.createdAt, chunks: [...job.chunks]
+  };
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("completed", "readwrite");
+    tx.objectStore("completed").put(snapshot);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error("Unable to store the print preview."));
+    tx.onabort = () => reject(tx.error || new Error("Print preview storage was aborted."));
+  });
+}
+
+async function restoreCompletedPrintJob(jobId) {
+  const db = await openPrintRecoveryDb();
+  if (!db) return null;
+  const stored = await new Promise((resolve, reject) => {
+    const tx = db.transaction("completed", "readonly");
+    const request = tx.objectStore("completed").get(jobId);
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error || new Error("Could not load the saved print preview."));
+  });
+  if (!stored) return null;
+  if (Date.now() - stored.createdAt >= PRINT_RECOVERY_TTL_MS ||
+      !Array.isArray(stored.chunks) ||
+      stored.chunks.length !== stored.totalChunks ||
+      stored.chunks.some((part) => typeof part !== "string") ||
+      stored.receivedChunks !== stored.totalChunks ||
+      stored.receivedChars > MAX_PRINT_JOB_CHARS) {
+    await removeCompletedPrintJob(jobId);
+    return null;
+  }
+  return { ...stored, complete: true, port: null, sentChunks: 0, endSent: false };
+}
+
+async function removeCompletedPrintJob(jobId) {
+  const db = await openPrintRecoveryDb();
+  if (!db) return;
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("completed", "readwrite");
+    tx.objectStore("completed").delete(jobId);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error("Unable to delete stored print preview."));
+    tx.onabort = () => reject(tx.error || new Error("Print preview cleanup was aborted."));
+  });
+}
+
+
 
 let visibleCaptureQueue = Promise.resolve();
 let lastVisibleCaptureStartedAt = 0;
@@ -90,6 +167,8 @@ function cleanupPrintJob(jobId, { closeTab = false } = {}) {
   const job = printJobs.get(jobId);
   if (!job) return;
   printJobs.delete(jobId);
+  // The extension owns the data; discard it once the preview consumed it.
+  void removeCompletedPrintJob(jobId).catch(() => {});
   if (closeTab && Number.isInteger(job.printTabId)) {
     chrome.tabs.remove(job.printTabId).catch(() => {});
   }
@@ -122,14 +201,27 @@ chrome.runtime.onConnect.addListener((port) => {
 
   port.onMessage.addListener((message) => {
     if (message?.type === "CHATFOLIO_PRINT_READY") {
-      const job = printJobs.get(message.jobId);
-      if (!job) {
-        safePost(port, { type: "CHATFOLIO_PRINT_ERROR", error: "The print job expired. Please export again." });
-        return;
-      }
-      attachedJobId = job.id;
-      job.port = port;
-      flushPrintJob(job);
+      // Send every chunk again on reconnect. The print view deduplicates by
+      // chunk index and will only assemble a complete document once.
+      void (async () => {
+        let job = printJobs.get(message.jobId);
+        if (!job) {
+          job = await restoreCompletedPrintJob(message.jobId);
+          if (job) printJobs.set(job.id, job);
+        }
+        if (!job || (Number.isInteger(port.sender?.tab?.id) &&
+            Number.isInteger(job.printTabId) && port.sender.tab.id !== job.printTabId)) {
+          safePost(port, { type: "CHATFOLIO_PRINT_ERROR", error: "The print job expired or is unavailable. Please export again." });
+          return;
+        }
+        attachedJobId = job.id;
+        job.port = port;
+        job.sentChunks = 0;
+        job.endSent = false;
+        flushPrintJob(job);
+      })().catch(() => {
+        safePost(port, { type: "CHATFOLIO_PRINT_ERROR", error: "The saved print view could not be restored. Please export again." });
+      });
       return;
     }
 
@@ -373,13 +465,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, error: `Print transfer incomplete (${job.receivedChunks}/${job.totalChunks} chunks).` });
       return;
     }
-    job.complete = true;
-    flushPrintJob(job);
-    if (Number.isInteger(job.printTabId)) {
-      chrome.tabs.update(job.printTabId, { active: true }).catch(() => {});
-    }
-    sendResponse({ ok: true, printTabId: job.printTabId });
-    return;
+    // Persist *before* acknowledging success: a suspended worker can then
+    // re-send the completed preview to a reconnecting print page.
+    storeCompletedPrintJob(job).then(() => {
+      job.complete = true;
+      flushPrintJob(job);
+      if (Number.isInteger(job.printTabId)) {
+        chrome.tabs.update(job.printTabId, { active: true }).catch(() => {});
+      }
+      sendResponse({ ok: true, printTabId: job.printTabId });
+    }).catch((error) => {
+      sendResponse({ ok: false, error: error?.message || "Could not preserve the print preview." });
+    });
+    return true;
   }
 
   if (message.type === "CHATFOLIO_PRINT_ABORT") {
