@@ -36,7 +36,7 @@ jobs:
       - name: Build and verify Chrome ZIP
         run: npm run build
       - name: Release safety gate (no publishing)
-        run: python scripts/release_gate.py --expected-version 1.8.11
+        run: python scripts/release_gate.py
       - name: Upload tested ZIP artifact
         uses: actions/upload-artifact@v4
         with:
