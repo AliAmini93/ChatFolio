@@ -28,6 +28,29 @@ For an installed system Chromium, use:
 CHATFOLIO_CHROMIUM=/usr/bin/chromium npm test
 ```
 
+### Real MV3 integration test on Chrome 137+ (Phase 6A)
+
+Official Google Chrome 137+ does **not** support side-loading an unpacked
+extension through the command-line `--load-extension` flag. As a result, do not
+run the real MV3 smoke test against `/usr/bin/google-chrome-stable`: the
+background worker will never appear. Use the unbranded Playwright Chromium
+instead:
+
+```sh
+PY="/path/to/your/venv/bin/python3"
+"$PY" -m playwright install chromium
+CHATFOLIO_CHROMIUM=/usr/bin/google-chrome-stable "$PY" scripts/test.py
+```
+
+`CHATFOLIO_CHROMIUM` continues to select Google Chrome for all other browser
+regressions but is intentionally ignored by the **real extension-loading**
+fixture (`tests/test_mv3_extension_phase6a.py`). That single test uses the
+Playwright-managed Chromium. If necessary, select another compatible unbranded
+Chromium/Chrome for Testing binary with `CHATFOLIO_EXTENSION_CHROMIUM=/path/to/browser`.
+Using a Chrome for Testing build is also supported; regular Google Chrome is
+not. The extension test uses a fresh disposable profile and never accesses
+logged-in provider sessions.
+
 To run one regression while developing:
 
 ```bash
