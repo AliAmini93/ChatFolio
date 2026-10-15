@@ -109,6 +109,10 @@ export function createPrintHtmlSanitizer({ document }) {
   function cleanInlineStyle(node, insideMath) {
     if (!node.hasAttribute('style')) return;
     const declarations = node.style;
+    if (!declarations) {
+      node.removeAttribute('style');
+      return;
+    }
     for (const name of [...declarations]) {
       const lower = name.toLowerCase();
       const value = declarations.getPropertyValue(name);
