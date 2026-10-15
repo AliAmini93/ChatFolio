@@ -73,6 +73,10 @@ with sync_playwright() as p:
  # Phase 5C1 adds a final provider-independent scrub. Disable it only for
  # this intentionally broken 'before' reproduction so baseline remains valid.
  control_source=control_source.replace('    sanitizePrintClone(clone);','    // sanitizer intentionally disabled in control fixture;')
+ # 5C2 adds a final PDF-renderer sanitizer. The intentionally insecure
+ # 'before' fixture must also bypass that layer to reproduce historical CSS
+ # leakage; otherwise the control no longer represents the old behavior.
+ control_source=control_source.replace('html: sanitizeMessageHtml(message.html)', 'html: message.html')
  # Remove the new structural reset in the control as well.
  control_source=control_source.replace('''    .message-body :is(div, section, article, figure, picture) {
       min-height: 0 !important;
