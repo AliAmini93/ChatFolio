@@ -24,7 +24,7 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-SETUP = """
+SETUP = """() => {
 window.sent = [];
 window.chrome = {
   runtime: {
@@ -53,6 +53,7 @@ window.attachPort = () => {
   window.__connectHandler(port);
   return port;
 };
+}
 """
 
 with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
