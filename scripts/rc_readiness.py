@@ -47,54 +47,68 @@ def verify_candidate_identity(tag: str, expected_sha: str, *, root: Path = ROOT)
     return {"tag": tag, "version": version, "source_sha": actual_sha}
 
 
+def verify_qa_report_file(path: Path, provider: str, scenario: str) -> None:
+    """Apply the exact RC release gate to a single fixed-name local QA report.
+
+    This helper is also used by the Phase 8A overview so the dashboard can
+    never show PASS for a report that the RC release gate would reject.
+    No private PDF, user path, or report payload is ever printed.
+    """
+    if provider not in REQUIRED_SCENARIOS or scenario not in REQUIRED_SCENARIOS[provider]:
+        raise ValueError("Unknown provider or mandatory scenario.")
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Missing or unsupported local QA report for " +
+                         provider + "/" + scenario + ".")
+    if path.stat().st_size > 64 * 1024:
+        raise ValueError("QA report exceeds the small metadata-only limit.")
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError("Could not read a counts-only QA report.") from None
+    if not isinstance(report, dict) or report.get("schema_version") != 1:
+        raise ValueError("QA report schema is not supported.")
+    if (report.get("provider") != provider or
+            report.get("scenario") != scenario or
+            report.get("verdict") != "pass" or
+            report.get("live_provider_confirmed") is not True):
+        raise ValueError("QA report not explicitly passed: " + provider + "/" + scenario + ".")
+    checks = report.get("required_manual_checks")
+    if not isinstance(checks, dict) or set(checks) != set(SCENARIO_CHECKS[scenario]):
+        raise ValueError("QA report is missing required manual checks.")
+    if any(value != "pass" for value in checks.values()):
+        raise ValueError("QA report includes unchecked or failed source comparison.")
+    if report.get("blockers"):
+        raise ValueError("QA report contains release blockers.")
+    if scenario != "stop":
+        turns = report.get("source_turn_count")
+        metrics = report.get("pdf_metrics")
+        if type(turns) is not int or turns < 1:
+            raise ValueError("QA report has no verified source turn count.")
+        if not isinstance(metrics, dict):
+            raise ValueError("QA report lacks PDF metadata.")
+        pages = metrics.get("pages")
+        text_pages = metrics.get("pages_with_selectable_text")
+        if (type(pages) is not int or pages < 1 or
+                type(text_pages) is not int or text_pages < 1):
+            raise ValueError("QA report has no searchable PDF pages.")
+        if scenario == "media":
+            uploads = report.get("source_upload_count")
+            if type(uploads) is not int or uploads < 1:
+                raise ValueError("Media QA requires at least one verified source upload.")
+    elif report.get("pdf_metrics") is not None:
+        raise ValueError("Stop QA must not include a PDF.")
+
+
 def verify_local_qa(qa_dir: Path) -> dict:
-    # Only known fixed filenames are read. No conversation PDFs, browser state,
-    # user-supplied paths or arbitrary JSON files are inspected or uploaded.
+    # Validate exactly the fixed required names, sharing the same validator
+    # with the read-only QA progress matrix (Phase 8A).
     count = 0
     for provider, scenarios in REQUIRED_SCENARIOS.items():
         for scenario in scenarios:
-            expected = qa_dir / (provider + "-" + scenario + ".json")
-            if expected.is_symlink() or not expected.is_file():
-                raise ValueError("Missing or unsupported local QA report for " +
-                                 provider + "/" + scenario + ".")
-            if expected.stat().st_size > 64 * 1024:
-                raise ValueError("QA report exceeds the small metadata-only limit.")
-            try:
-                report = json.loads(expected.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError):
-                raise ValueError("Could not read a counts-only QA report.") from None
-            if not isinstance(report, dict) or report.get("schema_version") != 1:
-                raise ValueError("QA report schema is not supported.")
-            if (report.get("provider") != provider or
-                    report.get("scenario") != scenario or
-                    report.get("verdict") != "pass" or
-                    report.get("live_provider_confirmed") is not True):
-                raise ValueError("QA report not explicitly passed: " + provider + "/" + scenario + ".")
-            checks = report.get("required_manual_checks")
-            if not isinstance(checks, dict) or set(checks) != set(SCENARIO_CHECKS[scenario]):
-                raise ValueError("QA report is missing required manual checks.")
-            if any(value != "pass" for value in checks.values()):
-                raise ValueError("QA report includes unchecked or failed source comparison.")
-            if report.get("blockers"):
-                raise ValueError("QA report contains release blockers.")
-            if scenario != "stop":
-                turns = report.get("source_turn_count")
-                metrics = report.get("pdf_metrics")
-                if type(turns) is not int or turns < 1:
-                    raise ValueError("QA report has no verified source turn count.")
-                if not isinstance(metrics, dict):
-                    raise ValueError("QA report lacks PDF metadata.")
-                pages = metrics.get("pages")
-                text_pages = metrics.get("pages_with_selectable_text")
-                if (type(pages) is not int or pages < 1 or
-                        type(text_pages) is not int or text_pages < 1):
-                    raise ValueError("QA report has no searchable PDF pages.")
-                if scenario == "media":
-                    uploads = report.get("source_upload_count")
-                    if type(uploads) is not int or uploads < 1:
-                        raise ValueError("Media QA requires at least one verified source upload.")
-            elif report.get("pdf_metrics") is not None:
-                raise ValueError("Stop QA must not include a PDF.")
+            verify_qa_report_file(
+                qa_dir / (provider + "-" + scenario + ".json"),
+                provider, scenario,
+            )
             count += 1
     return {
         "report_count": count,
