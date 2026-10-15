@@ -31,6 +31,16 @@ For **each** provider (ChatGPT, Claude, Gemini), test on the user's own browser 
 - **Gemini:** virtualized history, duplicate compact user prompt cleanup, offscreen protected `googleusercontent.com` photo capture/restore, long reply pagination without blank half-pages.
 - **All:** browser print output on multiple pages: readable A4 text, page counter order, sensible breaking at figures/tables, no orphan author label, no provider toolbar or action buttons.
 
+## Local acceptance reporter (Phase 6B2)
+
+Use [the Phase 6B2 instructions](phase6b2-live-acceptance.md) to export from
+your own logged-in sessions, compare with the original site, and record only
+aggregate metadata using `scripts/qa_live_provider.py`. No provider session
+or private PDF is available to CI. A passing PDF metadata audit alone does
+**not** prove source-message completeness, correct image fidelity, or safe
+Temporary Chat behavior. All live-session entries below remain **Not run**
+until manually verified and explicitly recorded.
+
 ## Recording results
 
 Capture only **non-sensitive metadata** (browser build, OS, extension commit SHA, provider, scenario, approximate turn count, PDF page count, pass/fail, redacted issue description). Never commit, upload or paste conversation text, screenshots, generated PDFs or signed media URLs. Preserve the local `Previous Chats/` folder outside Git. Do not copy logged-in browser profiles or cookies to CI.
