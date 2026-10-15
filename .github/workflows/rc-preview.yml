@@ -84,6 +84,6 @@ jobs:
       - name: Explain preview-only result
         run: |
           echo "### ChatFolio unpublished RC preview" >> "$GITHUB_STEP_SUMMARY"
-          echo "Verified commit: `$GITHUB_SHA`." >> "$GITHUB_STEP_SUMMARY"
+          printf "Verified commit: %s\n" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
           echo "This run created **no Git tag, GitHub Release or store upload**." >> "$GITHUB_STEP_SUMMARY"
           echo "Human QA attestation was supplied; private reports were not uploaded." >> "$GITHUB_STEP_SUMMARY"
