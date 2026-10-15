@@ -70,6 +70,9 @@ with sync_playwright() as p:
  current_source=new.read_text()
  # Control reproduces the provider CSS leak by omitting only the new class/data normalization.
  control_source=current_source.replace('      removeProviderPresentationHooks(node);','      // normalization intentionally disabled in control fixture;')
+ # Phase 5C1 adds a final provider-independent scrub. Disable it only for
+ # this intentionally broken 'before' reproduction so baseline remains valid.
+ control_source=control_source.replace('    sanitizePrintClone(clone);','    // sanitizer intentionally disabled in control fixture;')
  # Remove the new structural reset in the control as well.
  control_source=control_source.replace('''    .message-body :is(div, section, article, figure, picture) {
       min-height: 0 !important;
