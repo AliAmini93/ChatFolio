@@ -69,6 +69,28 @@ async function restoreCompletedPrintJob(jobId) {
   return { ...stored, complete: true, port: null, sentChunks: 0, endSent: false };
 }
 
+async function pruneCompletedPrintJobs({ closedTabId = null } = {}) {
+  const db = await openPrintRecoveryDb();
+  if (!db) return;
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("completed", "readwrite");
+    const request = tx.objectStore("completed").openCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      const item = cursor.value;
+      if (Date.now() - item.createdAt >= PRINT_RECOVERY_TTL_MS ||
+          (closedTabId !== null && (item.printTabId === closedTabId || item.sourceTabId === closedTabId))) {
+        cursor.delete();
+      }
+      cursor.continue();
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error("Unable to prune old print jobs."));
+    tx.onabort = () => reject(tx.error || new Error("Print recovery cleanup was aborted."));
+  });
+}
+
 async function removeCompletedPrintJob(jobId) {
   const db = await openPrintRecoveryDb();
   if (!db) return;
@@ -571,6 +593,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  void pruneCompletedPrintJobs({ closedTabId: tabId }).catch(() => {});
   const active = await getActiveExport();
   if (active?.tabId === tabId) await setActiveExport(null);
 
@@ -586,8 +609,12 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (active.url && changeInfo.url !== active.url) await setActiveExport(null);
 });
 
+// Clean up snapshots abandoned by closed tabs or expired workers.
+void pruneCompletedPrintJobs().catch(() => {});
+
 // Drop orphaned print jobs if a print page never connects.
 setInterval(() => {
+  void pruneCompletedPrintJobs().catch(() => {});
   const cutoff = Date.now() - 10 * 60 * 1000;
   for (const [jobId, job] of printJobs) {
     if (job.createdAt < cutoff) cleanupPrintJob(jobId, { closeTab: true });
