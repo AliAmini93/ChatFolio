@@ -3980,46 +3980,73 @@
     }
   }
 
+  function canRetryInterruptedPrintTransfer(error) {
+    const message = String(error?.message || error || "");
+    return /message port closed|receiving end does not exist|extension context invalidated|service worker|the print job is no longer available|the print job expired/i.test(message);
+  }
+
   async function deliverPrintableDocumentViaExtensionPage(html, title, session) {
-    const jobId = makePrintJobId();
     const memory = clampNumber(navigator.deviceMemory || 4, 1, 32);
     const chunkSize = memory >= 8 ? 512 * 1024 : (memory >= 4 ? 384 * 1024 : 256 * 1024);
     const totalChunks = Math.max(1, Math.ceil(html.length / chunkSize));
-    let began = false;
 
-    try {
-      const begin = await sendRuntimeMessage({
-        type: 'CHATFOLIO_PRINT_BEGIN',
-        jobId,
-        title: String(title || `${PLATFORM.name} Conversation`),
-        platform: PLATFORM.id,
-        platformName: PLATFORM.name,
-        totalChunks,
-        sourceUrl: location.href
-      });
-      if (!begin?.ok) throw new Error(begin?.error || 'Could not open the ChatFolio print view.');
-      began = true;
-
-      const indices = Array.from({ length: totalChunks }, (_value, index) => index);
-      await mapWithConcurrency(indices, async (index) => {
-        throwIfCancelled(session);
-        const chunk = html.slice(index * chunkSize, (index + 1) * chunkSize);
-        const response = await sendRuntimeMessage({ type: 'CHATFOLIO_PRINT_CHUNK', jobId, index, data: chunk });
-        if (!response?.ok) throw new Error(response?.error || `Could not transfer print data (${index + 1}/${totalChunks}).`);
-        return true;
-      }, {
-        concurrency: adaptiveTransferConcurrency(),
-        signal: session.controller.signal
-      });
-
+    // The source page already owns the generated HTML. If MV3 loses an
+    // incomplete transfer, replay once rather than persisting incomplete data.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
       throwIfCancelled(session);
-      const end = await sendRuntimeMessage({ type: 'CHATFOLIO_PRINT_END', jobId });
-      if (!end?.ok) throw new Error(end?.error || 'Could not finalize the ChatFolio print view.');
-    } catch (error) {
-      if (began) {
-        try { await sendRuntimeMessage({ type: 'CHATFOLIO_PRINT_ABORT', jobId }); } catch {}
+      const jobId = makePrintJobId();
+      let began = false;
+      let printTabId = null;
+
+      try {
+        const begin = await sendRuntimeMessage({
+          type: 'CHATFOLIO_PRINT_BEGIN',
+          jobId,
+          title: String(title || PLATFORM.name + ' Conversation'),
+          platform: PLATFORM.id,
+          platformName: PLATFORM.name,
+          totalChunks,
+          sourceUrl: location.href
+        });
+        if (!begin?.ok) throw new Error(begin?.error || 'Could not open the ChatFolio print view.');
+        began = true;
+        printTabId = Number.isInteger(begin.printTabId) ? begin.printTabId : null;
+
+        const indices = Array.from({ length: totalChunks }, (_value, index) => index);
+        await mapWithConcurrency(indices, async (index) => {
+          throwIfCancelled(session);
+          const chunk = html.slice(index * chunkSize, (index + 1) * chunkSize);
+          const response = await sendRuntimeMessage({ type: 'CHATFOLIO_PRINT_CHUNK', jobId, index, data: chunk });
+          if (!response?.ok) throw new Error(response?.error || 'Could not transfer print data (' + (index + 1) + '/' + totalChunks + ').');
+          return true;
+        }, {
+          concurrency: adaptiveTransferConcurrency(),
+          signal: session.controller.signal
+        });
+
+        throwIfCancelled(session);
+        const end = await sendRuntimeMessage({ type: 'CHATFOLIO_PRINT_END', jobId });
+        if (!end?.ok) throw new Error(end?.error || 'Could not finalize the ChatFolio print view.');
+        return;
+      } catch (error) {
+        const interrupted = canRetryInterruptedPrintTransfer(error);
+        // PRINT_END may have committed despite the callback port closing.
+        // Preserve that completed preview instead of generating a duplicate.
+        if (began && interrupted && !session.controller.signal.aborted) {
+          try {
+            const status = await sendRuntimeMessage({ type: 'CHATFOLIO_PRINT_STATUS', jobId });
+            if (status?.ok && status.complete) return;
+          } catch {}
+        }
+        if (began) {
+          try {
+            await sendRuntimeMessage({ type: 'CHATFOLIO_PRINT_ABORT', jobId, printTabId });
+          } catch {}
+        }
+        if (!interrupted || attempt === 1) throw error;
+        throwIfCancelled(session);
+        await sleep(300);
       }
-      throw error;
     }
   }
 
