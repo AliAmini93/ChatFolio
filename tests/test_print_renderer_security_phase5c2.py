@@ -52,7 +52,7 @@ with sync_playwright() as p:
       const font = {
         base:{fontFamily:'Arial; background: url(https://unsafe.invalid/style.css)'},
         rtl:{fontFamily:'"Noto Sans Arabic", Tahoma, sans-serif'},
-        ltr:{fontFamily:'Inter, Arial, sans-serif'},
+        ltr:{fontFamily:'Inter, Arial, sans-serif; background: url(https://unsafe.invalid/ltr.css)'},
         fontFaceCss:'</style><script>window.FONT_PWNED=1</script><style>@import url(https://unsafe.invalid/font.css)'
       };
       return window.__testPhase5C2.buildPrintableDocument(
