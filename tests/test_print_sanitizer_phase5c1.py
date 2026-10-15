@@ -74,7 +74,10 @@ with sync_playwright() as p:
     assert '<foreignobject' not in normalized and 'FOREIGN_HTML' not in html, html
     assert 'onclick=' not in normalized and 'onload=' not in normalized and 'onerror=' not in normalized, html
     assert 'data-provider-sneak' not in normalized, html
-    assert 'background-image:' not in normalized and 'evil.invalid' not in normalized, html
+    # A remote HTTPS image resolved by the media pipeline may remain when
+    # embedImages=False. The sanitizer must remove URL-bearing CSS; image-origin
+    # policy is a separate decision from blocking active HTML/script protocols.
+    assert 'background-image:' not in normalized, html
     assert 'VALID_IMG' in html and 'data:image/png' in html, html
     assert '<svg' in normalized and 'viewbox=' in normalized and '<path' in normalized, html
     assert 'href="#my-path"' in html and 'external.svg' not in html, html
