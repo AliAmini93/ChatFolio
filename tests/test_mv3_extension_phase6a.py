@@ -124,7 +124,9 @@ with TemporaryDirectory(prefix="chatfolio-real-mv3-") as profile:
             assert "Voltage" in rendered and "2.5" in rendered, rendered[:400]
             image_src = print_page.frame_locator("#preview").locator("img").get_attribute("src")
             assert image_src == SAFE_PNG
-            assert print_page.locator("#printAgain").is_visible()
+            # Print begins after the frame/fonts settle; wait for the
+            # actionable control, rather than racing the 150 ms print delay.
+            print_page.locator("#printAgain").wait_for(state="visible", timeout=5000)
             assert print_page.title() == "Phase 6A real MV3 printable document"
 
             # The preview consumes the complete job and the background should
