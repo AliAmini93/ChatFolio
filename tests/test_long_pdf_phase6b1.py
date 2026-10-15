@@ -123,7 +123,7 @@ with sync_playwright() as p:
             page.set_content(html, wait_until="load", timeout=30000)
             page.pdf(
                 path=str(output), format="A4", prefer_css_page_size=True,
-                print_background=True, display_header_footer=True, timeout=60000
+                print_background=True, display_header_footer=True
             )
             summary = audit_pdf(output)
             assert 5 <= summary["pages"] <= 110, summary
