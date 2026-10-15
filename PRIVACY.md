@@ -1,6 +1,6 @@
 # ChatFolio Privacy Policy
 
-Last updated: September 24, 2026
+Last updated: October 15, 2026
 
 ChatFolio is a browser extension for exporting supported AI conversations to PDF.
 
@@ -21,6 +21,8 @@ ChatFolio does not collect analytics, advertising identifiers, account credentia
 ## Local storage
 
 The extension may store local preferences such as theme, reading density, message-number visibility, image inclusion, and export-time display using Chrome extension storage. These settings remain in the user's browser unless the user clears extension data or removes the extension.
+
+For print-preview recovery, ChatFolio may temporarily save a **completed** printable conversation (including embedded images and text) in IndexedDB under the extension's own browser origin. This local snapshot allows the print view to be restored if Chrome suspends its service worker after the transfer completes. It is deleted when the print view confirms consumption, when a related tab closes, or through expiry cleanup after 10 minutes while the extension runs. If the browser or extension is not running, expired snapshots are cleaned up on the next service-worker activation. Snapshots are never uploaded to a ChatFolio service. Clearing the extension's website/storage data or uninstalling the extension removes them.
 
 ## Permissions
 
