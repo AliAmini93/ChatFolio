@@ -3720,7 +3720,8 @@
 
   /* @chatfolio-pdf-document-renderer */
   const { buildPrintableDocument, splitPrintableMessageOpening, groupMessagesIntoExchanges, detectDocumentProfile } = createPdfDocumentRenderer({
-    document, Node, Element, escapeHtml, mergeFontStacks, inferDirection
+    document, Node, Element, escapeHtml, mergeFontStacks, inferDirection,
+    sanitizePrintClone
   });
 
   function collectDomDiagnostics() {
