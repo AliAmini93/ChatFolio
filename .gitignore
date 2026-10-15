@@ -9,3 +9,6 @@
 .pytest_cache/
 .DS_Store
 *.log
+
+# Private local acceptance reports (never check into GitHub)
+/.chatfolio-qa/
