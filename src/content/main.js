@@ -2592,6 +2592,9 @@
     applyDirectionality(clone);
     removeEmptyUiRemnants(clone);
     trimTrailingEmptyContent(clone);
+    // Defense in depth: the detached authored clone is now fully prepared.
+    // Strip active markup, external SVG references and unsafe attributes here.
+    sanitizePrintClone(clone);
 
     // Prefer the authored message subtree when it contains useful content, but keep
     // media/attachment siblings from the whole turn. The full clone is intentionally
@@ -3688,6 +3691,9 @@
     if (normalizedPrimary.includes("system-ui") && normalizedPrimary.includes("sans-serif")) return clean;
     return `${clean}, ${fallback}`;
   }
+
+  /* @chatfolio-print-html-sanitizer */
+  const { sanitizePrintClone } = createPrintHtmlSanitizer({ document });
 
   /* @chatfolio-image-pipeline */
   const {
