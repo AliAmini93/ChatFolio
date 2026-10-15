@@ -130,9 +130,9 @@ const printSanitizerSource = readFileSync(join(root, 'src/security/print-html.js
 const printSanitizerDeclaration = 'export function createPrintHtmlSanitizer({';
 if (source.split(printSanitizerMarker).length !== 2 ||
     printSanitizerSource.split(printSanitizerDeclaration).length !== 2 ||
-    (printSanitizerSource.match(/\\bexport\\s+function\\b/g) ?? []).length !== 1 ||
-    /^\\s*import\\s/m.test(printSanitizerSource) ||
-    /\\bexport\\s+(?!function\\s)/m.test(printSanitizerSource)) {
+    (printSanitizerSource.match(/\bexport\s+function\b/g) ?? []).length !== 1 ||
+    /^\s*import\s/m.test(printSanitizerSource) ||
+    /\bexport\s+(?!function\s)/m.test(printSanitizerSource)) {
   throw new Error('Print HTML sanitizer module or insertion marker has invalid structure');
 }
 const embeddedPrintSanitizer = printSanitizerSource.replace(printSanitizerDeclaration, 'function createPrintHtmlSanitizer({');
