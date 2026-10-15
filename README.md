@@ -114,7 +114,9 @@ Licensed under MIT; see [LICENSE](LICENSE). ChatGPT, Claude, and Gemini are trad
 The stable v1.8.11 runtime is currently preserved while the development
 infrastructure is modernized in small, reviewable steps. See
 [Development and testing](docs/development.md),
-[Contributing](CONTRIBUTING.md), and
+[Contributing](CONTRIBUTING.md),
+[Release process and QA gates](docs/releases/release-process.md),
+[Security policy](SECURITY.md), and
 [Architecture decision 0001](docs/architecture/0001-baseline-and-ci.md).
 
 Developer commands: `npm run check` validates syntax and manifest assets,
