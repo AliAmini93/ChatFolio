@@ -128,4 +128,17 @@ with TemporaryDirectory(prefix="chatfolio-rc-qa-synthetic-") as dirname:
     except ValueError:
         pass
 
+
+# The manual Actions workflow must remain an unpublished read-only preview.
+workflow = (ROOT / ".github/workflows/rc-preview.yml").read_text(encoding="utf-8")
+assert "workflow_dispatch:" in workflow
+assert "pull_request:" not in workflow and "push:" not in workflow
+assert "contents: read" in workflow and "persist-credentials: false" in workflow
+assert 'refs/heads/main' in workflow
+assert "name: chatfolio-rc-preview-unpublished" in workflow
+assert "python scripts/rc_readiness.py" in workflow
+assert "python scripts/release_gate.py" in workflow
+for forbidden in ("gh release create", "git push", "create-release", "contents: write"):
+    assert forbidden not in workflow
+
 print("PASS: exact SHA and RC tag, 22 synthetic QA gates, incomplete/failed/missing reports blocked")
