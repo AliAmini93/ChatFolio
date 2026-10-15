@@ -238,7 +238,7 @@ export function createPdfDocumentRenderer({
   <style>
     /* Provider font-family stacks are retained after validation. Untrusted
        raw @font-face CSS must not be inserted into the report style element:
-       it could contain @import, network URLs or a closing </style> tag. */
+       it could contain @import, network URLs or an HTML style-element terminator. */
 
     @page {
       size: A4;
