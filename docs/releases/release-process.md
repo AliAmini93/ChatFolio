@@ -69,6 +69,18 @@ Keep the existing CI workflow as the source of truth for job naming.
    and distribution procedure. **Phase 7A does not create a tag, publish a
    release, enable auto-release, or update Chrome Web Store.**
 
+## Phase 7B: manual preview without publication
+
+The [RC preview procedure](rc-preview.md) documents the strict
+`scripts/rc_readiness.py` identity/QA gate, local-only 22-scenario
+ChatGPT/Claude/Gemini report validation, and the **manual**
+`.github/workflows/rc-preview.yml` workflow. That job can create a
+short-lived, unpublished Actions artifact only; it **does not** create
+tags, releases or browser-store uploads. A proposed `v1.9.0-rc.1`
+cannot pass until the manifest and npm package both have version
+`1.9.0` in a separately reviewed PR. The real-provider QA matrix
+remains open until independently inspected in the local browser.
+
 ## What counts as release evidence
 
 CI passing proves synthetic regression and artifact integrity only. The
