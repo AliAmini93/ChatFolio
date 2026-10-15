@@ -502,10 +502,57 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "CHATFOLIO_PRINT_STATUS") {
+    const jobId = String(message.jobId || "");
+    const sourceTabId = sender.tab?.id;
+    const respond = (job) => {
+      if (!Number.isInteger(sourceTabId) || !job || job.sourceTabId !== sourceTabId) {
+        sendResponse({ ok: false, error: "Print job is no longer available." });
+        return;
+      }
+      sendResponse({ ok: true, complete: job.complete, printTabId: job.printTabId });
+    };
+    const inMemory = printJobs.get(jobId);
+    if (inMemory) respond(inMemory);
+    else restoreCompletedPrintJob(jobId).then(respond).catch(() => {
+      sendResponse({ ok: false, error: "Could not inspect print job state." });
+    });
+    return true;
+  }
+
   if (message.type === "CHATFOLIO_PRINT_ABORT") {
-    cleanupPrintJob(String(message.jobId || ""), { closeTab: true });
-    sendResponse({ ok: true });
-    return;
+    const jobId = String(message.jobId || "");
+    const sourceTabId = sender.tab?.id;
+    const job = printJobs.get(jobId);
+    if (job) {
+      if (!Number.isInteger(sourceTabId) || job.sourceTabId !== sourceTabId) {
+        sendResponse({ ok: false, error: "Print job belongs to another source tab." });
+        return;
+      }
+      cleanupPrintJob(jobId, { closeTab: true });
+      sendResponse({ ok: true });
+      return;
+    }
+    // Following a worker restart the old Map is empty. A retrying source can
+    // still close *its exact* orphan preview, but never an unrelated browser tab.
+    const candidate = Number(message.printTabId);
+    if (!Number.isInteger(sourceTabId) || !Number.isInteger(candidate) || candidate < 0 || !jobId) {
+      sendResponse({ ok: true });
+      return;
+    }
+    (async () => {
+      const stored = await restoreCompletedPrintJob(jobId);
+      if (stored && stored.sourceTabId !== sourceTabId) {
+        return { ok: false, error: "Print job belongs to another source tab." };
+      }
+      const tab = await chrome.tabs.get(candidate);
+      const expected = chrome.runtime.getURL("print.html?job=" + encodeURIComponent(jobId));
+      if (tab?.url !== expected) return { ok: false, error: "Print tab could not be verified." };
+      if (stored) await removeCompletedPrintJob(jobId);
+      await chrome.tabs.remove(candidate);
+      return { ok: true };
+    })().then(sendResponse).catch(() => sendResponse({ ok: false, error: "Old print tab could not be closed." }));
+    return true;
   }
 
   if (message.type === "CHATFOLIO_EXPORT_STARTED") {
