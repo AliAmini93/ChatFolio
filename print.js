@@ -8,8 +8,13 @@ const chunks = [];
 let blobUrl = "";
 let loadedFrame = null;
 let finished = false;
+let failed = false;
+let activePrintPort = null;
+let reconnectAttempts = 0;
+const MAX_PRINT_RECONNECTS = 5;
 
 function setError(message) {
+  failed = true;
   statusTitle.textContent = "Could not prepare the print view";
   statusText.textContent = message || "Please return to the conversation and export again.";
   printAgain.hidden = true;
@@ -60,10 +65,22 @@ printAgain.addEventListener("click", printCurrentFrame);
 if (!jobId) {
   setError("Missing print job identifier.");
 } else {
-  const port = chrome.runtime.connect({ name: "chatfolio-print" });
-  port.postMessage({ type: "CHATFOLIO_PRINT_READY", jobId });
+  connectPrintPort();
+}
 
+function connectPrintPort() {
+  if (finished || failed) return;
+  let port;
+  try {
+    port = chrome.runtime.connect({ name: "chatfolio-print" });
+    activePrintPort = port;
+  } catch {
+    schedulePrintReconnect();
+    return;
+  }
   port.onMessage.addListener(async (message) => {
+    if (port !== activePrintPort || failed) return;
+    reconnectAttempts = 0;
     if (message?.type === "CHATFOLIO_PRINT_ERROR") {
       setError(message.error);
       return;
@@ -93,7 +110,7 @@ if (!jobId) {
         loadedFrame = frame;
         await waitForFrameDocument(frame);
         document.body.classList.add("ready");
-        try { port.postMessage({ type: "CHATFOLIO_PRINT_CONSUMED", jobId }); } catch {}
+        try { activePrintPort?.postMessage({ type: "CHATFOLIO_PRINT_CONSUMED", jobId }); } catch {}
         await sleep(150);
         await printCurrentFrame();
       }, { once: true });
@@ -103,8 +120,27 @@ if (!jobId) {
   });
 
   port.onDisconnect.addListener(() => {
-    if (!finished) setError("The extension print service stopped unexpectedly. Please export again.");
+    if (port !== activePrintPort || finished || failed) return;
+    schedulePrintReconnect();
   });
+
+  try {
+    port.postMessage({ type: "CHATFOLIO_PRINT_READY", jobId });
+  } catch {
+    schedulePrintReconnect();
+  }
+}
+
+function schedulePrintReconnect() {
+  if (finished || failed) return;
+  if (reconnectAttempts >= MAX_PRINT_RECONNECTS) {
+    setError("The print service stopped and recovery failed. Please export again.");
+    return;
+  }
+  reconnectAttempts += 1;
+  statusText.textContent = "Reconnecting to the print service...";
+  const delayMs = Math.min(250 * (2 ** (reconnectAttempts - 1)), 2500);
+  setTimeout(connectPrintPort, delayMs);
 }
 
 window.addEventListener("beforeunload", () => {
