@@ -58,9 +58,27 @@ with TemporaryDirectory(prefix="chatfolio-real-mv3-") as profile:
                 "--load-extension=" + str(ROOT),
             ],
         }
-        if os.environ.get("CHATFOLIO_CHROMIUM"):
-            launch["executable_path"] = os.environ["CHATFOLIO_CHROMIUM"]
-        context = p.chromium.launch_persistent_context(**launch)
+        # Branded Google Chrome 137+ ignores --load-extension. Other browser
+        # fixtures may use CHATFOLIO_CHROMIUM=/usr/bin/google-chrome-stable,
+        # but genuine MV3 tests need unbranded Chromium / Chrome for Testing.
+        # Use a separate environment variable to prevent accidental override.
+        extension_browser = os.environ.get("CHATFOLIO_EXTENSION_CHROMIUM")
+        if extension_browser:
+            launch["executable_path"] = extension_browser
+        try:
+            context = p.chromium.launch_persistent_context(**launch)
+        except Exception as error:
+            if "Executable doesn't exist" in str(error) or (
+                "browserType.launchPersistentContext" in str(error) and
+                "install" in str(error)
+            ):
+                raise RuntimeError(
+                    "Phase 6A requires unbranded Chromium for MV3 tests. "
+                    "Install: python -m playwright install chromium (using "
+                    "the same Python environment). CHATFOLIO_CHROMIUM is "
+                    "intentionally ignored by this one integration test."
+                ) from error
+            raise
         try:
             worker = (
                 context.service_workers[0] if context.service_workers
