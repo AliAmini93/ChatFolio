@@ -124,13 +124,26 @@ if (source.split(turnMediaMarker).length !== 2 ||
   throw new Error('Turn media module factory or insertion marker has invalid structure');
 }
 const embeddedTurnMedia = turnMediaSource.replace(turnMediaDeclaration, 'function createTurnMediaProcessor({');
+// Phase 5C1: detached printable DOM sanitization.
+const printSanitizerMarker = '  /* @chatfolio-print-html-sanitizer */';
+const printSanitizerSource = readFileSync(join(root, 'src/security/print-html.js'), 'utf8').trimEnd();
+const printSanitizerDeclaration = 'export function createPrintHtmlSanitizer({';
+if (source.split(printSanitizerMarker).length !== 2 ||
+    printSanitizerSource.split(printSanitizerDeclaration).length !== 2 ||
+    (printSanitizerSource.match(/\\bexport\\s+function\\b/g) ?? []).length !== 1 ||
+    /^\\s*import\\s/m.test(printSanitizerSource) ||
+    /\\bexport\\s+(?!function\\s)/m.test(printSanitizerSource)) {
+  throw new Error('Print HTML sanitizer module or insertion marker has invalid structure');
+}
+const embeddedPrintSanitizer = printSanitizerSource.replace(printSanitizerDeclaration, 'function createPrintHtmlSanitizer({');
 const generated = source.replace(marker, definitions.join('\n\n'))
   .replace(metadataMarker, `  // BEGIN GENERATED ChatGPT metadata parsers\n${embeddedMetadata}\n  // END GENERATED ChatGPT metadata parsers`)
   .replace(transportMarker, `  // BEGIN GENERATED ChatGPT transport\n${embeddedTransport}\n  // END GENERATED ChatGPT transport`)
   .replace(geminiHistoryMarker, `  // BEGIN GENERATED Gemini history scanner\n${embeddedGeminiHistory}\n  // END GENERATED Gemini history scanner`)
   .replace(pdfRendererMarker, `  // BEGIN GENERATED PDF document renderer\n${embeddedPdfRenderer}\n  // END GENERATED PDF document renderer`)
   .replace(mediaMarker, `  // BEGIN GENERATED Image pipeline\n${embeddedMedia}\n  // END GENERATED Image pipeline`)
-  .replace(turnMediaMarker, `  // BEGIN GENERATED turn media\n${embeddedTurnMedia}\n  // END GENERATED turn media`);
+  .replace(turnMediaMarker, `  // BEGIN GENERATED turn media\n${embeddedTurnMedia}\n  // END GENERATED turn media`)
+  .replace(printSanitizerMarker, `  // BEGIN GENERATED print sanitizer\n${embeddedPrintSanitizer}\n  // END GENERATED print sanitizer`);
 const dest = join(root, 'content.js');
 if (process.argv.includes('--write')) {
   writeFileSync(dest, generated, 'utf8');
