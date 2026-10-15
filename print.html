@@ -15,7 +15,10 @@
     h1 { font-size: 20px; margin: 0 0 8px; }
     p { margin: 0; color: #60706a; line-height: 1.5; }
     #printAgain { margin-top: 16px; border: 0; border-radius: 10px; padding: 10px 16px; background: #237b65; color: #fff; font: inherit; font-weight: 700; cursor: pointer; }
+    #printAgain { position: fixed; inset: auto 18px 18px auto; z-index: 5; box-shadow: 0 5px 20px rgba(0,0,0,.16); }
+    #printAgain:focus-visible { outline: 3px solid #77cbb6; outline-offset: 3px; }
     #printAgain[hidden] { display: none; }
+    @media print { #printAgain { display: none !important; } }
     #preview { width: 100%; height: 100%; border: 0; display: block; visibility: hidden; background: #fff; }
     body.ready #preview { visibility: visible; }
     body.ready #statusWrap { display: none; }
@@ -33,9 +36,9 @@
       <div class="mark">CF</div>
       <h1 id="statusTitle">Preparing your print view</h1>
       <p id="statusText">ChatFolio is transferring the conversation from the source tab.</p>
-      <button id="printAgain" type="button" hidden>Print again</button>
     </div>
   </div>
+  <button id="printAgain" type="button" hidden>Print again</button>
   <iframe id="preview" title="ChatFolio printable conversation"></iframe>
   <script src="print.js"></script>
 </body>
