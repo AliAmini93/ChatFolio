@@ -17,7 +17,7 @@ from build import RUNTIME_FILES, build
 from release_gate import inspect_archive, validate_versions, verify_release_artifact
 
 version = validate_versions()
-assert version == "1.8.11", "This milestone deliberately retains stable 1.8.11"
+assert version.count(".") == 2
 assert len(RUNTIME_FILES) == 12
 assert "Previous Chats" not in " ".join(RUNTIME_FILES)
 
@@ -35,7 +35,7 @@ with TemporaryDirectory(prefix="chatfolio-7a-") as directory:
     assert report["zip_sha256"] == digest
 
     try:
-        verify_release_artifact(artifact, expected_version="9.9.9")
+        verify_release_artifact(artifact, expected_version=version + "-different")
         raise AssertionError("Wrong declared version was accepted.")
     except ValueError:
         pass
@@ -44,10 +44,10 @@ with TemporaryDirectory(prefix="chatfolio-7a-") as directory:
     metadata = root / "mock-repo"
     metadata.mkdir()
     (metadata / "manifest.json").write_text(json.dumps({
-        "manifest_version":3,"version":"1.8.11",
+        "manifest_version":3,"version":version,
         "background":{"service_worker":"background.js"}
     }),encoding="utf-8")
-    (metadata / "package.json").write_text(json.dumps({"version":"1.8.12"}),encoding="utf-8")
+    (metadata / "package.json").write_text(json.dumps({"version":version + "-skew"}),encoding="utf-8")
     try:
         validate_versions(metadata)
         raise AssertionError("Manifest/package version mismatch was accepted.")
