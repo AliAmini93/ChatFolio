@@ -51,3 +51,35 @@ Only after direct real-PDF comparison may this PR be considered for merge.
 
 Stable release `v1.8.11`, manifest/package version, permissions, tags and
 the protected local `Previous Chats/` directory remain unchanged.
+
+## Phase 8C2: pasted user logs, independently identified assistant reply
+
+The follow-up 55-page / 99-message real export exposes a second case:
+even the *recent* answer may appear as raw `<CodeBlock>` markup when the
+preceding user message is an extensive copied terminal output. Existing
+user identity matching requires almost-exact normalized user text and can
+fail when the live bubble is truncated or substantially reformatted.
+
+The additional fallback accepts a mounted assistant response only when:
+
+- It belongs to an actual `[data-turn-key]` ChatGPT exchange with a user
+  bubble. User content is removed before comparing assistant prose.
+- At least **three different substantial prose anchors** from the API
+  assistant appear in the mounted assistant response, covering at least
+  **75%** of eligible candidate lines. Code, headings and short labels do
+  not count.
+- The match is **mutually unique**: precisely one API assistant and one
+  visible assistant qualify. If an answer is repeated by either source,
+  or is echoed only by the user, no overlay is permitted.
+- API progress messages, original turn keys and image-bearing answers
+  remain untouched unless the existing guards authorize a safe overlay.
+
+The independent Chromium test
+`tests/test_chatgpt_prose_identity_phase8c2.py` produces a PDF with a
+real table and clickable link and tests ambiguous repeated assistant
+answers, two matching mounted groups, assistant text echoed solely in
+the user prompt, and absent/unrelated rendered content.
+
+This is still a **guarded heuristic** and cannot regenerate Rich UI
+for messages absent from the mounted browser DOM. Real-provider visual
+validation of the affected latest replies is required before merging.
