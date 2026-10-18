@@ -47,6 +47,29 @@ Distinct progress notes and unmatched content remain intact. This does
 not promise perfect deduplication for every ChatGPT API format; unresolved
 cases should remain in review rather than receiving a false QA pass.
 
+## Follow-up: accurately match multi-part assistant replies
+
+The next real 51-page PDF exposed a more specific issue: 19 user items and 66
+assistant metadata items included several consecutive progress/final pieces,
+while the 2026 grouped ChatGPT DOM mounts a single assembled assistant surface
+per user turn. The original positional matcher attached that surface to the
+first assistant after its user anchor, leaving the final rich response in raw
+API form.
+
+For a uniquely anchored user with *multiple* subsequent API assistants,
+the candidate rich surface now requires a **unique** match against substantial
+prose spans (at least two matches and 60% of available anchors) from ONE
+assistant message in that same uninterrupted run. Other progress pieces are
+kept in original order and with their original media; no contents from a
+different branch are guessed. With ambiguous/missing anchors the full raw
+metadata remains, rather than falsifying a match. A corresponding Chromium
+regression tests a short user + two progress assistants + final rich answer.
+
+This is a partial mitigation. It does not automatically re-render earlier
+Rich UI widgets no longer mounted in the current browser, and it does not
+justify deleting API messages merely because they look related. Real-provider
+manual re-export and review remain required before merge.
+
 ## What is and is not fixed
 
 This improves high-fidelity capture for Rich UI currently mounted in the
