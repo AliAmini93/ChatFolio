@@ -83,3 +83,42 @@ the user prompt, and absent/unrelated rendered content.
 This is still a **guarded heuristic** and cannot regenerate Rich UI
 for messages absent from the mounted browser DOM. Real-provider visual
 validation of the affected latest replies is required before merging.
+
+## Reality check after 8C2: not yet accepted
+
+The 58-page real ChatGPT PDF on the updated code **does not** restore parity:
+the same reply (#81) that rendered with actual screenshots and seven clickable
+links in the previous 55-page output reverts to literal Rich UI source tags
+in the new PDF. The new reply (#104) likewise contains literal `<CodeBlock>`.
+The newer PDF has 104 numbered messages, but its page images/links decreased
+from 6/7 (previous) to 4/0. This is a visual regression **in the observed
+exports**, not proof that code is the sole cause: ChatGPT may virtualize or
+unmount the relevant DOM between exports.
+
+No real conversation text, source URLs, filenames, screenshots or PDFs
+are stored in GitHub; only anonymized counts above are documented.
+
+### Diagnostic counters (temporary QA)
+
+A single `ChatFolio Rich UI QA (counts only):` console message appears
+after a metadata-based export. Its JSON object includes only integer counts:
+`apiTurns`, `apiAssistants`, `apiRawRich`, `mountedTurns`,
+`mountedAssistants`, `matchedAssistants`, `matchedRawRich`,
+`enrichedAssistants`, `enrichedRawRich`, `skippedApiMedia`,
+`skippedDisconnected`, `skippedShortLiveText`, `failedCapture`.
+
+A low `mountedAssistants` count suggests virtualized/unavailable live DOM.
+A low `matchedAssistants` count with mounted turns suggests alignment
+failure. A high `matchedAssistants` but low `enrichedAssistants` count
+suggests capture or truncation skip. None of these counts include content.
+
+To collect: reload the unpacked extension and ChatGPT page, open the Chrome
+DevTools **Console** on the ChatGPT tab, export normally with ChatFolio,
+then filter for `ChatFolio Rich UI QA (counts only):` and copy **only** the
+JSON counter object. Do not share other console output, storage or request
+headers. An absent summary may mean the DOM-only or visual-backup export
+path was used.
+
+PR remains Draft: do not merge or publish a stable release until a real
+PDF again shows the last relevant reply with a rendered link/table/code
+block, preserves prior images/links, and does not lose any message.
