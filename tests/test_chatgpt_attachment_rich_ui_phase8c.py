@@ -25,7 +25,9 @@ SOURCE = SOURCE.replace(
 )
 SOURCE = SOURCE.rsplit("})();", 1)[0] + (
     "window.__phase8c={getMessageNodes,matchedChatGPTLiveAssistantTurns,"
-    "enhanceChatGPTMetadataWithRenderedDom,buildPrintableDocument};})();"
+    "enhanceChatGPTMetadataWithRenderedDom,buildPrintableDocument,"
+    "chatGPTAttachmentUserSignature,chatGPTRenderedUserAttachmentSignature,"
+    "chatGPTAssistantContentOverlap,findMatchedAssistantInRun};})();"
 )
 
 
@@ -107,6 +109,21 @@ with sync_playwright() as playwright:
         assert result["messages"][0]["html"] == api[0]["html"]
         assert result["messages"][1]["html"] == api[1]["html"]
         assert result["messages"][2]["html"] == api[2]["html"]
+        if "<table" not in result["messages"][3]["html"]:
+            debug = page.evaluate("""messages => {
+              const n=window.__phase8c.getMessageNodes();
+              return {
+                roles:n.map(x=>x.getAttribute('data-conversation-role')||x.getAttribute('data-user-message-bubble')),
+                apiSignature:window.__phase8c.chatGPTAttachmentUserSignature(messages[0]),
+                domSignature:window.__phase8c.chatGPTRenderedUserAttachmentSignature(n[0]),
+                pairs:[...window.__phase8c.matchedChatGPTLiveAssistantTurns(messages,n).keys()],
+                matched:window.__phase8c.findMatchedAssistantInRun(messages,1,n[1]),
+                renderedText:(n[1]?.closest('[data-turn-key]')?.innerText||'').slice(0,800),
+                overlap:window.__phase8c.chatGPTAssistantContentOverlap(messages[3].text,n[1]?.closest('[data-turn-key]')?.innerText||''),
+                html:messages[3].html.slice(0,150)
+              };
+            }""", api)
+            print("DEBUG phase8c:", debug, flush=True)
         assert "<table" in result["messages"][3]["html"]
         assert "RAW_ATTACHMENT_DIL" not in result["messages"][3]["html"]
         assert filename1 in result["printable"] and filename2 in result["printable"]
