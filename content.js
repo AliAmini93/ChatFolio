@@ -1781,6 +1781,53 @@
     return resolved.length >= 2 ? resolved.join("\u001f") : "";
   }
 
+
+  function chatGPTMountedAssistantText(node) {
+    // A 2026 grouped turn holds BOTH the user bubble and assistant. Do not
+    // score prose echoed by the user as evidence of an assistant match.
+    const group = node?.closest?.("[data-turn-key]");
+    if (!group || !group.querySelector?.("[data-user-message-bubble]")) return "";
+    const cloned = group.cloneNode(true);
+    cloned.querySelectorAll(
+      '[data-user-message-bubble], [data-conversation-role="user"],' +
+      ' [data-message-author-role="user"]'
+    ).forEach(element => element.remove());
+    return cloned.innerText || cloned.textContent || "";
+  }
+
+  function matchChatGPTByUniqueAssistantProse(apiMessages, liveNodes, roles, pairs) {
+    // Last-resort recovery when pasted terminal logs, rich user surfaces or
+    // truncated cards prevent exact user-text matching. Identity comes from
+    // three DISTINCT substantial authored prose anchors, unique across ALL
+    // candidate API assistants AND ALL mounted assistant groups. Never use
+    // a single heading, position, a generic success label, or shared code.
+    const rendered = liveNodes.map((node, index) => ({
+      node, index,
+      text: roles[index] === "assistant" ? chatGPTMountedAssistantText(node) : ""
+    })).filter(item => item.text && item.node?.isConnected);
+    if (!rendered.length) return;
+    const matches = [];
+    for (let apiIndex = 0; apiIndex < apiMessages.length; apiIndex++) {
+      if (apiMessages[apiIndex]?.role !== "assistant" || pairs.has(apiIndex)) continue;
+      for (const item of rendered) {
+        const overlap = chatGPTAssistantContentOverlap(
+          apiMessages[apiIndex].text, item.text
+        );
+        if (overlap.total < 3 || overlap.hits < 3 ||
+            overlap.hits < Math.ceil(overlap.total * 0.75)) continue;
+        matches.push({ apiIndex, domIndex: item.index, node: item.node });
+      }
+    }
+    // Mutual uniqueness is mandatory: two metadata segments resembling one
+    // authored response, or two identical mounted replies, both fail closed.
+    for (const candidate of matches) {
+      if (matches.filter(item => item.apiIndex === candidate.apiIndex).length !== 1 ||
+          matches.filter(item => item.domIndex === candidate.domIndex).length !== 1 ||
+          [...pairs.values()].includes(candidate.node)) continue;
+      pairs.set(candidate.apiIndex, candidate.node);
+    }
+  }
+
   function matchedChatGPTLiveAssistantTurns(apiMessages, liveNodes) {
     const pairs = new Map();
     if (!apiMessages?.length || !liveNodes?.length) return pairs;
@@ -1877,6 +1924,7 @@
           overlap.hits < Math.ceil(overlap.total * 0.6)) continue;
       pairs.set(matched, liveNodes[domIndex + 1]);
     }
+    matchChatGPTByUniqueAssistantProse(apiMessages, liveNodes, roles, pairs);
     return pairs;
   }
 
