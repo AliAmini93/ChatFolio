@@ -166,3 +166,51 @@ original scroll position. Numeric-only QA diagnostics now include
 an export of the user's 112-turn example, send only numeric console
 counters, and compare recent and older formatted replies and embedded
 images/links. No private chat, PDF or browser profile is committed.
+
+## Phase 8D follow-up: live 119-turn PDF (partial success)
+
+Real Ubuntu test at `ab33bc5`: 83 Node / 34 Chromium / release gate
+all passed. User Chrome diagnostic (numbers only):
+
+```json
+{"apiTurns":119,"apiAssistants":91,"apiRawRich":38,
+ "mountedTurns":10,"mountedAssistants":6,
+ "matchedAssistants":5,"matchedRawRich":5,
+ "enrichedAssistants":5,"enrichedRawRich":5,"failedCapture":0,
+ "scanWindows":6,"scanRestored":true}
+```
+
+Actual 71-page PDF has 119 consecutively numbered messages, 12 PDF
+link annotations and 10 PDF image occurrences, compared with 104 messages,
+0 links and 4 image occurrences in the 58-page earlier export. The latest
+answer contains a formatted table/code block; older pages still show
+literal layout tags. The improvement is verified, but parity **is not**:
+five assistant segments enriched out of 38 with raw Rich UI indicators.
+Some raw tags are intentionally quoted inside code; the counters do
+not prove that all other 33 are broken.
+
+`scanWindows=6` counts capture calls, NOT unique virtualized pages;
+alone it does not diagnose whether the scroller ended early, hydration
+was delayed or content was never re-mounted.
+
+### Delayed-history stabilization and counters
+
+A fixed three-round ~600ms top wait could miss ChatGPT history
+prepending after scroll-to-top. The scanner now waits for up to five
+stable top frontiers with a bounded 12-round/7-second polling period.
+It uses a smaller scroll step for denser viewport coverage while
+retaining its 35-second/72-step movement limit and original scroll
+restoration. Additional privacy-safe fields:
+`scanSteps`, `scanTopWaitRounds`, `scanMaxMountedTurns`,
+`scanStopReason` (a fixed diagnostic enum). No message content,
+file names or URLs are logged.
+
+The Chromium virtual scroll regression now intentionally defers
+mounting the first two authored groups by 850ms after the scanner
+reaches the top; without stabilization, the first group is missed.
+The test still demands all nine formatted responses, all PDF links
+and original scroll position. A successful test is **not** a guarantee
+of recovery of every historic real-provider widget.
+
+Continue to block merge and stable release until the user's newer
+real PDF passes both visual parity and the existing QA matrix.
