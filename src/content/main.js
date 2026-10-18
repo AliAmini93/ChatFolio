@@ -667,6 +667,230 @@
     };
   }
 
+
+  // Phase 8B: metadata is authoritative for message count and branch ordering,
+  // but its plain-text part strings do not contain the rendered ChatGPT Rich UI
+  // (tables, link cards, formatted responses, DIL components). Where live
+  // authored DOM can be associated with a particular API turn unambiguously,
+  // use its already-sanitized printable markup while retaining the API list.
+  // Never infer a missing turn from the live DOM or reorder metadata.
+  function comparableChatGPTTurnText(value) {
+    return normalizeText(value || "")
+      .replace(/[\u200c\u200d\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function sameChatGPTUserTurn(apiTurn, domNode) {
+    if (apiTurn?.role !== "user" || ADAPTER.getRole(domNode) !== "user") return false;
+    const original = comparableChatGPTTurnText(apiTurn.text);
+    const visible = comparableChatGPTTurnText(domNode?.innerText || domNode?.textContent);
+    // Exact user text is a stronger anchor than an ordinal / assistant label.
+    // Never match tiny generic fragments or truncated DOM user messages.
+    if (!original || !visible) return false;
+    return original === visible || (
+      original.length >= 32 && visible.length >= 32 &&
+      original.includes(visible) && visible.length >= original.length * 0.85
+    );
+  }
+
+
+  function chatGPTAssistantContentOverlap(apiText, renderedText) {
+    // Deliberately use only substantial natural-language prose, not tags,
+    // markup attributes, code snippets, labels, generic "PASS" or headings.
+    // This is an identity check, not a general semantic similarity matcher.
+    const candidateLines = String(apiText || "").split(/\r?\n/)
+      .map(line => line.trim().replace(/^#{1,6}\s+/, "").replace(/\*\*/g, ""))
+      .filter(line => line.length >= 60 && !/[<>{}]/.test(line))
+      .filter(line => !/^(?:[-+*]\s|bash\b|npm\b|git\b|echo\b|PY=|EXPECTED=|cd\b)/.test(line))
+      .map(line => comparableChatGPTTurnText(line).slice(0, 55));
+    const anchors = [...new Set(candidateLines)].slice(0, 16);
+    if (anchors.length < 2) return { hits: 0, total: anchors.length };
+    const visible = comparableChatGPTTurnText(renderedText).replace(/\*\*/g, "");
+    return { hits: anchors.filter(anchor => visible.includes(anchor)).length, total: anchors.length };
+  }
+
+  function findMatchedAssistantInRun(apiMessages, startIndex, liveAssistantNode) {
+    let end = startIndex;
+    while (end < apiMessages.length && apiMessages[end]?.role === "assistant") end++;
+    if (end === startIndex + 1) return startIndex;
+    // The modern [data-conversation-role=assistant] node may contain only
+    // the small "ChatGPT said:" caption. The authored response lives in
+    // sibling nodes under the same [data-turn-key] wrapper; findTurn() is
+    // already responsible for identifying that safe complete turn container.
+    const renderedTurn = ADAPTER.findTurn(liveAssistantNode) || liveAssistantNode;
+    const renderedText = renderedTurn?.innerText || renderedTurn?.textContent || "";
+    const scores = [];
+    for (let i = startIndex; i < end; i++) {
+      const overlap = chatGPTAssistantContentOverlap(apiMessages[i]?.text, renderedText);
+      scores.push({ index: i, ...overlap });
+    }
+    const qualifying = scores.filter(score =>
+      score.total >= 2 && score.hits >= 2 &&
+      score.hits >= Math.ceil(score.total * 0.6));
+    if (qualifying.length !== 1) {
+      // In split runs, positional matching is unsafe. Prefer complete API
+      // output over replacing a progress segment with unrelated final HTML.
+      return -1;
+    }
+    return qualifying[0].index;
+  }
+
+  function matchedChatGPTLiveAssistantTurns(apiMessages, liveNodes) {
+    const pairs = new Map();
+    if (!apiMessages?.length || !liveNodes?.length) return pairs;
+    const roles = liveNodes.map(node => ADAPTER.getRole(node));
+    const complete = liveNodes.length === apiMessages.length &&
+      apiMessages.every((message, index) => message.role === roles[index]);
+    if (complete) {
+      const eligibleUsers = apiMessages.map((message, index) =>
+        message.role === "user" && comparableChatGPTTurnText(message.text).length > 0 ? index : -1
+      ).filter(index => index >= 0);
+      const correctUsers = eligibleUsers.filter(index =>
+        sameChatGPTUserTurn(apiMessages[index], liveNodes[index]));
+      // Without multiple correct anchors an equal-length DOM may represent a
+      // different branch; do not overlay an unrelated response.
+      const minimum = Math.min(eligibleUsers.length, 2);
+      if (minimum > 0 && correctUsers.length >= minimum &&
+          correctUsers.length >= Math.ceil(eligibleUsers.length * 0.8)) {
+        for (let index = 0; index < apiMessages.length; index++) {
+          if (roles[index] === "assistant") pairs.set(index, liveNodes[index]);
+        }
+        return pairs;
+      }
+    }
+
+    // Current ChatGPT groups each user bubble with its next assistant response.
+    // In virtualized history, align only a *unique* exact user message in both
+    // lists and its assistant sibling from the SAME [data-turn-key] group.
+    // This conservative partial path never attaches an answer by role alone.
+    const apiUsers = new Map();
+    const domUsers = new Map();
+    const add = (map, key, index) => {
+      if (!key || key.length < 3) return;
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(index);
+    };
+    apiMessages.forEach((message, index) => {
+      if (message.role === "user") add(apiUsers, comparableChatGPTTurnText(message.text), index);
+    });
+    liveNodes.forEach((node, index) => {
+      if (roles[index] === "user") {
+        add(domUsers, comparableChatGPTTurnText(node.innerText || node.textContent), index);
+      }
+    });
+    for (const [text, indexes] of apiUsers) {
+      const liveIndexes = domUsers.get(text) || [];
+      if (indexes.length !== 1 || liveIndexes.length !== 1) continue;
+      const apiIndex = indexes[0], domIndex = liveIndexes[0];
+      if (apiMessages[apiIndex + 1]?.role !== "assistant" ||
+          roles[domIndex + 1] !== "assistant") continue;
+      const userGroup = liveNodes[domIndex].closest?.("[data-turn-key]");
+      const assistantGroup = liveNodes[domIndex + 1].closest?.("[data-turn-key]");
+      if (!userGroup || assistantGroup !== userGroup) continue;
+      const matched = findMatchedAssistantInRun(apiMessages, apiIndex + 1, liveNodes[domIndex + 1]);
+      if (matched >= 0) pairs.set(matched, liveNodes[domIndex + 1]);
+    }
+    return pairs;
+  }
+
+
+  function confirmedRenderedAssistantDuplicate(apiText, visibleText) {
+    // Only consider a rich markup source fragment, not ordinary repeated prose.
+    // The mounted assistant surface may contain the fully assembled final
+    // response while a later metadata message holds that same raw DIL source.
+    const raw = String(apiText || "");
+    if (!/<(?:grid|grid-item|box|row|CodeBlock|Link|title|caption|badge|table|Chart|AsyncImage)\b/i.test(raw)) return false;
+    const visible = comparableChatGPTTurnText(visibleText).replace(/[*_~]/g, "");
+    const anchors = [...new Set(raw.split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line => !/[<>{}]/.test(line) && !/^(?:bash |npm |git |echo |[-*+] )/.test(line))
+      .map(line => comparableChatGPTTurnText(line.replace(/[*_~]/g, "")))
+      .filter(line => line.length >= 65)
+      .map(line => line.slice(0, 78)))];
+    if (anchors.length < 2) return false;
+    const hits = anchors.filter(anchor => visible.includes(anchor)).length;
+    return hits >= 2 && hits >= Math.ceil(anchors.length * 0.75);
+  }
+
+  function pruneProvenRenderedAssistantDuplicates(collected, pairs, originals) {
+    // Omit a later assistant only when an earlier response in the same
+    // uninterrupted assistant run was enriched from a stable DOM match and
+    // substantial prose from the later raw DIL item is already visible.
+    // Preserve unmatched progress, distinct replies and API-only media.
+    const skip = new Set();
+    for (const [index] of pairs) {
+      const enriched = collected.messages[index];
+      if (!enriched || enriched === originals[index]) continue;
+      for (let next = index + 1; next < collected.messages.length; next++) {
+        const candidate = collected.messages[next];
+        if (candidate.role !== "assistant" || pairs.has(next)) break;
+        if (Number(candidate.imageCount || 0) !== 0) continue;
+        if (confirmedRenderedAssistantDuplicate(originals[next]?.text, enriched.text)) {
+          skip.add(next);
+        }
+      }
+    }
+    if (skip.size) {
+      collected.messages = collected.messages.filter((_, index) => !skip.has(index));
+      console.info("ChatFolio: omitted verified duplicate raw Rich UI metadata segments:", skip.size);
+    }
+  }
+
+  async function enhanceChatGPTMetadataWithRenderedDom(collected, options, session) {
+    if (PLATFORM.id !== "chatgpt" || collected?.extractionSource !== "metadata" ||
+        !Array.isArray(collected.messages) || !collected.messages.length) return collected;
+    const liveNodes = getMessageNodes().filter(node =>
+      ADAPTER.getRole(node) === "user" || ADAPTER.getRole(node) === "assistant"
+    );
+    const pairs = matchedChatGPTLiveAssistantTurns(collected.messages, liveNodes);
+    if (!pairs.size) return collected;
+    const originalMessages = [...collected.messages];
+    let replacements = 0;
+    for (const [index, node] of pairs) {
+      throwIfCancelled(session);
+      assertSameConversation(session);
+      const original = collected.messages[index];
+      // An API-sourced image may have authentication/metadata unavailable to
+      // the live DOM. Never throw it away as part of a visual enhancement.
+      if (original.role !== "assistant" || Number(original.imageCount || 0) > 0 ||
+          !node.isConnected) continue;
+      try {
+        const turn = ADAPTER.findTurn(node);
+        const rendered = await serializeTurn(
+          turn, node, "assistant", options.embedImages !== false, session.controller.signal
+        );
+        throwIfCancelled(session);
+        assertSameConversation(session);
+        const visible = comparableChatGPTTurnText(rendered.text);
+        const source = comparableChatGPTTurnText(original.text);
+        // A substantially truncated live reply must not replace the complete
+        // API response. Markup source can be longer than displayed text.
+        if (!visible || (source.length > 240 && visible.length < Math.min(60, source.length * 0.1))) continue;
+        collected.messages[index] = {
+          ...original,
+          html: rendered.html,
+          text: rendered.text,
+          imageCount: Math.max(0, Number(rendered.imageCount || 0))
+        };
+        replacements += 1;
+      } catch (error) {
+        if (isCancelledError(error)) throw error;
+        // A rich snapshot is an optional fidelity enhancement, never a
+        // reason to discard the already complete ordered metadata response.
+        console.info("ChatFolio: retaining full ChatGPT metadata response; rich DOM capture unavailable.",
+          error?.message || String(error));
+      }
+    }
+    if (replacements) {
+      pruneProvenRenderedAssistantDuplicates(collected, pairs, originalMessages);
+      collected.imageCount = collected.messages.reduce((sum, message) =>
+        sum + Math.max(0, Number(message.imageCount || 0)), 0);
+      console.info("ChatFolio: enriched safely matched ChatGPT turns with rendered-page content:", replacements);
+    }
+    return collected;
+  }
+
   // ChatGPT can have tall wrappers (scrollHeight > clientHeight) that are NOT
   // scrollports. A candidate is usable only when its scroll actually moves the
   // authored conversation. Never fall back to the largest scrollHeight alone.
@@ -908,6 +1132,9 @@
       }
 
       if (!collected?.messages?.length) throw new Error("The semantic full-chat collector did not find any messages.");
+      if (PLATFORM.id === "chatgpt" && collected.extractionSource === "metadata") {
+        collected = await enhanceChatGPTMetadataWithRenderedDom(collected, options, session);
+      }
     } catch (error) {
       if (isCancelledError(error)) throw error;
       // Opening Assisted Visual Backup as a surprise after a scroll failure
