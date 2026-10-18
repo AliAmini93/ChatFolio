@@ -29,6 +29,24 @@ the visual direction of the live page.
   a partially mounted history, duplicate user prompts, wrong branch,
   and a response containing API-only media.
 
+## Verified split-assistant duplication regression
+
+The user's post-test 49-page PDF confirmed partial success: the newest
+mounted response had clickable links and a rendered result layout, and the
+two screenshots were embedded. But the API also yielded subsequent assistant
+metadata segments from the same generation; one repeated the rendered final
+answer with literal DIL markup in PDF pages 47-49.
+
+To avoid silently dropping genuine messages, this repair removes **only**
+later assistant metadata items that satisfy all of these requirements:
+the preceding assistant in the same uninterrupted run was safely matched
+to live DOM, the later item contains Rich UI source markup, contains no
+API media, and at least 75% of two or more substantial natural-language
+prose anchors are independently found in the previously rendered answer.
+Distinct progress notes and unmatched content remain intact. This does
+not promise perfect deduplication for every ChatGPT API format; unresolved
+cases should remain in review rather than receiving a false QA pass.
+
 ## What is and is not fixed
 
 This improves high-fidelity capture for Rich UI currently mounted in the
