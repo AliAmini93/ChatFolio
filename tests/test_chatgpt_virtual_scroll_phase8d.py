@@ -91,12 +91,24 @@ with sync_playwright() as playwright:
            const viewport=document.getElementById("scrollport");
            const track=document.getElementById("virtual-track");
            let previous = -1;
+           let prepended = false;
+           let prependTimer = null;
            const render = () => {
               const first=Math.max(0,Math.min(htmlGroups.length-2,
                   Math.floor(viewport.scrollTop/430)));
-              if(first===previous) return;
-              previous=first;
-              track.innerHTML=htmlGroups.slice(first,first+2).join("");
+              // Simulate asynchronous older-history hydration. The first
+              // two groups do not mount until 850ms AFTER scrolling to top.
+              if(first===0 && !prepended && !prependTimer) {
+                  prependTimer=setTimeout(() => {
+                      prepended=true;
+                      previous=-1;
+                      render();
+                  },850);
+              }
+              const effective=first===0 && !prepended ? 2 : first;
+              if(effective===previous) return;
+              previous=effective;
+              track.innerHTML=htmlGroups.slice(effective,effective+2).join("");
            };
            viewport.addEventListener("scroll",render);
            window.__phase8dRender=render;
@@ -142,6 +154,12 @@ with sync_playwright() as playwright:
         assert counters["mountedTurns"] == 4
         assert counters["enrichedRawRich"] == GROUPS, counters
         assert counters["scanWindows"] > 3
+        assert counters["scanTopWaitRounds"] >= 5, counters
+        assert counters["scanSteps"] >= 5, counters
+        assert counters["scanStopReason"] in {
+            "at-scroll-limit", "scroll-stalled", "short-scrollport",
+            "step-budget", "time-budget"
+        }, counters
         assert counters["scanRestored"] is True
         assert "Synthetic distinct question" not in snapshots[-1]
 
