@@ -186,7 +186,8 @@ with sync_playwright() as playwright:
         # Regression from the user's 49-page real PDF: one finalized rich
         # answer was captured as rendered HTML AND a subsequent split assistant
         # API message repeated the same DIL source as literal markup.
-        # Exclude only independently corroborated duplicate fragments.
+        # Prefer the final assistant with independently matched prose; preserve
+        # progress segments rather than falsely replacing or deleting them.
         prompt = "سؤال منحصر به فرد برای خروجی جدول پیشرفته و نمودار فارسی"
         prose = [
             "این یک توضیح کامل و مستقل درباره خروجی جدید است و باید همراه با جدول اصلی داخل فایل قابل جستجو باقی بماند.",
@@ -219,11 +220,15 @@ with sync_playwright() as playwright:
             {embedImages:false},{controller:new AbortController(),cancelled:false}
           )
         ).messages""", split)
-        assert len(resolved) == 3, resolved
-        assert [item["key"] for item in resolved] == [x["key"] for x in split[:3]]
-        assert "<table" in resolved[1]["html"]
-        assert resolved[2]["text"] == split[2]["text"], "Distinct progress must not be discarded"
-        assert not any("<grid" in item["html"] for item in resolved)
+        # The API has four distinct messages, but only the LAST assistant
+        # corresponds to the authored rich DOM. Earlier progress notes stay.
+        assert len(resolved) == 4, resolved
+        assert [item["key"] for item in resolved] == [x["key"] for x in split]
+        assert resolved[1]["html"] == split[1]["html"]
+        assert resolved[2]["html"] == split[2]["html"]
+        assert "<table" in resolved[3]["html"]
+        assert "Rich UI" in resolved[3]["html"]
+        assert "<grid" not in resolved[3]["html"]
 
         # Different authored rich content, even if it looks like a DIL
         # component, is NOT a duplicate and must not be discarded.
