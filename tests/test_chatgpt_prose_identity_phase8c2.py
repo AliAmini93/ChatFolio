@@ -106,6 +106,9 @@ with sync_playwright() as playwright:
         enhanced = page.evaluate(call, api)
         assert summary_logs and '"apiTurns":4' in summary_logs[-1], summary_logs
         assert '"enrichedRawRich":1' in summary_logs[-1], summary_logs[-1]
+        assert '"scanObservedAssistantGroups":1' in summary_logs[-1], summary_logs[-1]
+        assert '"scanMatchedAssistantGroups":1' in summary_logs[-1], summary_logs[-1]
+        assert '"scanUnmatchedAssistantGroups":0' in summary_logs[-1], summary_logs[-1]
         assert not any(prose[0] in line or long_input in line for line in summary_logs)
         assert len(enhanced) == len(api)
         assert [x["key"] for x in enhanced] == [x["key"] for x in api]

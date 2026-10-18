@@ -1806,6 +1806,30 @@
       text: roles[index] === "assistant" ? chatGPTMountedAssistantText(node) : ""
     })).filter(item => item.text && item.node?.isConnected);
     if (!rendered.length) return;
+    // Precompute file-card signatures per viewport instead of per pair;
+    // uniqueness and anti-ambiguity conditions stay unchanged.
+    const apiSignatures = apiMessages.map(message =>
+      chatGPTAttachmentUserSignature(message));
+    const apiCounts = new Map(), domCounts = new Map();
+    for (const sig of apiSignatures) {
+      if (sig) apiCounts.set(sig, (apiCounts.get(sig) || 0) + 1);
+    }
+    liveNodes.forEach((node, index) => {
+      if (roles[index] !== "user") return;
+      const sig = chatGPTRenderedUserAttachmentSignature(node);
+      if (sig) domCounts.set(sig, (domCounts.get(sig) || 0) + 1);
+    });
+    const preceding = [];
+    let precedingUserSig = "";
+    apiMessages.forEach((message, index) => {
+      if (message?.role === "user") precedingUserSig = apiSignatures[index];
+      preceding[index] = precedingUserSig;
+    });
+    for (const item of rendered) {
+      const user = item.node.closest("[data-turn-key]")
+        ?.querySelector("[data-user-message-bubble]");
+      item.domSig = chatGPTRenderedUserAttachmentSignature(user);
+    }
     const matches = [];
     for (let apiIndex = 0; apiIndex < apiMessages.length; apiIndex++) {
       if (apiMessages[apiIndex]?.role !== "assistant" || pairs.has(apiIndex)) continue;
@@ -1814,25 +1838,11 @@
         // File cards can be recognized even when filenames are injected into
         // the visible bubble with extra UI labels. Missing, mismatched or
         // duplicated attachment signatures are never acceptable.
-        let precedingUserIndex = apiIndex - 1;
-        while (precedingUserIndex >= 0 &&
-               apiMessages[precedingUserIndex]?.role !== "user") precedingUserIndex--;
-        const apiSignature = chatGPTAttachmentUserSignature(
-          apiMessages[precedingUserIndex]
-        );
-        const mountedUser = item.node.closest("[data-turn-key]")
-          ?.querySelector("[data-user-message-bubble]");
-        const domSignature = chatGPTRenderedUserAttachmentSignature(mountedUser);
+        const apiSignature = preceding[apiIndex], domSignature = item.domSig;
         if (apiSignature || domSignature) {
           if (!apiSignature || apiSignature !== domSignature) continue;
-          const apiCount = apiMessages.filter(message =>
-            chatGPTAttachmentUserSignature(message) === apiSignature
-          ).length;
-          const domCount = liveNodes.filter((node, index) =>
-            roles[index] === "user" &&
-            chatGPTRenderedUserAttachmentSignature(node) === apiSignature
-          ).length;
-          if (apiCount !== 1 || domCount !== 1) continue;
+          if (apiCounts.get(apiSignature) !== 1 ||
+              domCounts.get(apiSignature) !== 1) continue;
         }
         const overlap = chatGPTAssistantContentOverlap(
           apiMessages[apiIndex].text, item.text
@@ -2007,6 +2017,8 @@
       .test(String(message?.text || ""));
     const snapshots = new Map();
     const visitedGroupIds = new Set();
+    const observedAssistantGroups = new Set();
+    const matchedAssistantGroups = new Set();
     const initialNodes = getMessageNodes().filter(node =>
       ADAPTER.getRole(node) === "user" || ADAPTER.getRole(node) === "assistant"
     );
@@ -2036,6 +2048,9 @@
       scanSerializeMs: 0,
       scanMaxSerializeMs: 0,
       scanSerializeAttempts: 0,
+      scanObservedAssistantGroups: 0,
+      scanMatchedAssistantGroups: 0,
+      scanUnmatchedAssistantGroups: 0,
       scanMatchingMs: 0,
       scanElapsedMs: 0,
       scanRestored: true
@@ -2059,6 +2074,12 @@
         if (key) visitedGroupIds.add(key);
       }
       diagnostics.scanDistinctGroups = visitedGroupIds.size;
+      for (const node of nodes) {
+        if (ADAPTER.getRole(node) !== "assistant") continue;
+        const key = node.closest?.("[data-turn-key]")?.getAttribute?.("data-turn-key");
+        if (key) observedAssistantGroups.add(key);
+      }
+      diagnostics.scanObservedAssistantGroups = observedAssistantGroups.size;
       const matchingStarted = Date.now();
       const pairs = matchedChatGPTLiveAssistantTurns(originals, nodes);
       diagnostics.scanMatchingMs += Date.now() - matchingStarted;
@@ -2093,6 +2114,8 @@
             continue;
           }
           snapshots.set(index, rendered);
+          const key = node.closest?.("[data-turn-key]")?.getAttribute?.("data-turn-key");
+          if (key) matchedAssistantGroups.add(key);
         } catch (error) {
           if (isCancelledError(error)) throw error;
           diagnostics.failedCapture++;
@@ -2242,6 +2265,9 @@
       collected.imageCount = collected.messages.reduce((sum, message) =>
         sum + Math.max(0, Number(message.imageCount || 0)), 0);
     }
+    diagnostics.scanMatchedAssistantGroups = matchedAssistantGroups.size;
+    diagnostics.scanUnmatchedAssistantGroups = Math.max(0,
+      observedAssistantGroups.size - matchedAssistantGroups.size);
     diagnostics.scanElapsedMs = Date.now() - scanStarted;
     report();
     return collected;
