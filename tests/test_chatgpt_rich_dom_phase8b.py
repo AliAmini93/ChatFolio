@@ -182,7 +182,66 @@ with sync_playwright() as playwright:
           )
         ).messages""", media)
         assert held[1]["html"] == media[1]["html"]
+
+        # Regression from the user's 49-page real PDF: one finalized rich
+        # answer was captured as rendered HTML AND a subsequent split assistant
+        # API message repeated the same DIL source as literal markup.
+        # Exclude only independently corroborated duplicate fragments.
+        prompt = "سؤال منحصر به فرد برای خروجی جدول پیشرفته و نمودار فارسی"
+        prose = [
+            "این یک توضیح کامل و مستقل درباره خروجی جدید است و باید همراه با جدول اصلی داخل فایل قابل جستجو باقی بماند.",
+            "ما همچنین تعداد پیام‌ها و ترتیب آن‌ها را با اطلاعات اصلی می‌سنجیم و بررسی می‌کنیم که هیچ متنی بی‌دلیل حذف نشود.",
+            "در پایان تصویر و لینک علمی را با خروجی مرورگر مقایسه می‌کنیم تا تفاوت مهمی میان فایل چاپی و صفحه وجود نداشته باشد.",
+        ]
+        live = (
+            '<main><div data-turn-key="phase8b-split">'
+            '<div data-user-message-bubble>' + prompt + '</div>'
+            '<div data-conversation-role="assistant">ChatGPT said:</div>'
+            '<div class="response"><h3>نتایج نهایی</h3>'
+            + ''.join('<p>' + part + '</p>' for part in prose)
+            + '<table><tr><th>مورد</th><th>نتیجه</th></tr>'
+              '<tr><td>Rich UI</td><td>PASS</td></tr></table></div></div></main>'
+        )
+        page.set_content(live)
+        final_source = (
+            "## نتایج نهایی\n" + "\n".join(prose) +
+            "\n<grid columns={3}>\n<grid-item>\n<box>خام و تکراری</box>\n</grid-item>\n</grid>"
+        )
+        split = [
+            api_turn("user", prompt, 0),
+            api_turn("assistant", "جواب اولیه در حال پردازش", 1),
+            api_turn("assistant", "گزارش پیشرفت: هنوز در حال آزمایش مرورگر هستیم", 2),
+            api_turn("assistant", final_source, 3),
+        ]
+        resolved = page.evaluate("""async (messages) => (
+          await window.__phase8b.enhanceChatGPTMetadataWithRenderedDom(
+            {extractionSource:"metadata",messages,imageCount:0},
+            {embedImages:false},{controller:new AbortController(),cancelled:false}
+          )
+        ).messages""", split)
+        assert len(resolved) == 3, resolved
+        assert [item["key"] for item in resolved] == [x["key"] for x in split[:3]]
+        assert "<table" in resolved[1]["html"]
+        assert resolved[2]["text"] == split[2]["text"], "Distinct progress must not be discarded"
+        assert not any("<grid" in item["html"] for item in resolved)
+
+        # Different authored rich content, even if it looks like a DIL
+        # component, is NOT a duplicate and must not be discarded.
+        other = [dict(message) for message in split]
+        other[-1]["text"] = (
+            "<grid columns={2}>\n"
+            "این محتوای کاملاً مستقل هرگز نباید حذف شود و هیچ یک از جملات قبلی را تکرار نمی‌کند.\n"
+            "این بخش متفاوت است و همچنان باید در خروجی به عنوان یک پیام مستقل باقی بماند.\n"
+            "</grid>"
+        )
+        distinct = page.evaluate("""async (messages) => (
+          await window.__phase8b.enhanceChatGPTMetadataWithRenderedDom(
+            {extractionSource:"metadata",messages,imageCount:0},
+            {embedImages:false},{controller:new AbortController(),cancelled:false}
+          )
+        ).messages""", other)
+        assert len(distinct) == 4
     finally:
         chrome.close()
 
-print("PASS: ChatGPT API order + real rendered table, links, embedded PNG, virtualized/ambiguous guards")
+print("PASS: ChatGPT API order + real rendered table, links, embedded PNG, virtualized/ambiguous and verified duplicate guards")
