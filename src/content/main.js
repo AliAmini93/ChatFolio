@@ -714,7 +714,12 @@
     let end = startIndex;
     while (end < apiMessages.length && apiMessages[end]?.role === "assistant") end++;
     if (end === startIndex + 1) return startIndex;
-    const renderedText = liveAssistantNode?.innerText || liveAssistantNode?.textContent || "";
+    // The modern [data-conversation-role=assistant] node may contain only
+    // the small "ChatGPT said:" caption. The authored response lives in
+    // sibling nodes under the same [data-turn-key] wrapper; findTurn() is
+    // already responsible for identifying that safe complete turn container.
+    const renderedTurn = ADAPTER.findTurn(liveAssistantNode) || liveAssistantNode;
+    const renderedText = renderedTurn?.innerText || renderedTurn?.textContent || "";
     const scores = [];
     for (let i = startIndex; i < end; i++) {
       const overlap = chatGPTAssistantContentOverlap(apiMessages[i]?.text, renderedText);
