@@ -2024,6 +2024,10 @@
       skippedShortLiveText: 0,
       failedCapture: 0,
       scanWindows: 0,
+      scanSteps: 0,
+      scanTopWaitRounds: 0,
+      scanMaxMountedTurns: initialNodes.length,
+      scanStopReason: "not-needed",
       scanRestored: true
     };
     const report = () => console.info(
@@ -2037,6 +2041,7 @@
         ADAPTER.getRole(node) === "user" || ADAPTER.getRole(node) === "assistant"
       );
       diagnostics.scanWindows++;
+      diagnostics.scanMaxMountedTurns = Math.max(diagnostics.scanMaxMountedTurns, nodes.length);
       const pairs = matchedChatGPTLiveAssistantTurns(originals, nodes);
       for (const [index, node] of pairs) {
         if (snapshots.has(index)) continue;
@@ -2089,7 +2094,9 @@
       } catch (error) {
         if (isCancelledError(error)) throw error;
       }
+      diagnostics.scanStopReason = scroller ? "short-scrollport" : "no-scrollport";
       if (scroller && scrollRange(scroller) > 24) {
+        diagnostics.scanStopReason = "step-budget";
         const originalTop = getScrollTop(scroller);
         const prior = {
           behavior: scroller.style.getPropertyValue("scroll-behavior"),
@@ -2110,25 +2117,47 @@
           scroller.style.setProperty("scroll-snap-type", "none", "important");
           setScrollTop(scroller, 0);
           await sleepWithAbort(240, session.controller.signal);
-          // Prepending older messages may continue briefly after reaching top.
-          for (let round = 0; round < 3; round++) {
+          // Real ChatGPT can prepend earlier virtual groups asynchronously
+          // after reaching the top. A brief fixed 600ms wait misses those
+          // groups. Require five unchanged *top frontiers* (max 3.6s) while
+          // repeatedly capturing newly mounted responses.
+          let topFrontier = "";
+          let stableTop = 0;
+          for (let round = 0; round < 12 && Date.now() - started < 7000; round++) {
+            throwIfCancelled(session);
+            assertSameConversation(session);
             await captureWindow();
+            diagnostics.scanTopWaitRounds++;
+            const first = getMessageNodes()[0];
+            const key = first?.closest?.("[data-turn-key]")?.getAttribute?.("data-turn-key") || "";
+            const frontier = key || String(first?.textContent || "").slice(0, 96);
+            if (frontier && frontier === topFrontier) stableTop++;
+            else stableTop = 0;
+            topFrontier = frontier;
+            if (stableTop >= 5) break;
             setScrollTop(scroller, 0);
-            await sleepWithAbort(200, session.controller.signal);
+            await sleepWithAbort(300, session.controller.signal);
           }
           let stuck = 0;
           for (let step = 0; step < 72 && Date.now() - started < 35000; step++) {
             throwIfCancelled(session);
             assertSameConversation(session);
             await captureWindow();
+            diagnostics.scanSteps++;
             const top = getScrollTop(scroller);
             const range = scrollRange(scroller);
             const viewport = getClientHeight(scroller);
-            if (range <= 24) break;
-            const target = Math.min(range, top + Math.max(200, viewport * 0.55));
+            if (range <= 24) {
+              diagnostics.scanStopReason = "short-scrollport";
+              break;
+            }
+            const target = Math.min(range, top + Math.max(160, viewport * 0.42));
             if (target <= top + 3) {
               stuck++;
-              if (stuck >= 3) break;
+              if (stuck >= 3) {
+                diagnostics.scanStopReason = "at-scroll-limit";
+                break;
+              }
               await sleepWithAbort(260, session.controller.signal);
               continue;
             }
@@ -2137,8 +2166,12 @@
             const moved = getScrollTop(scroller);
             if (Math.abs(moved - top) <= 3) stuck++;
             else stuck = 0;
-            if (stuck >= 4) break;
+            if (stuck >= 4) {
+              diagnostics.scanStopReason = "scroll-stalled";
+              break;
+            }
           }
+          if (Date.now() - started >= 35000) diagnostics.scanStopReason = "time-budget";
           await captureWindow();
         } finally {
           // Always put the user's scroll position and inline styling back,
