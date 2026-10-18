@@ -736,6 +736,32 @@
     return qualifying[0].index;
   }
 
+
+  function chatGPTAttachmentIdentityKeys(value) {
+    // Only compare recognizable FILE names from user-owned content. The
+    // basename-tail avoids unrelated provider UI labels such as "Document"
+    // and "PDF", and deliberately ignores short generic filenames.
+    const names = String(value || "").match(
+      /[\p{L}\p{N}_.()-]{8,}\.(?:pdf|txt|zip|png|jpe?g|webp|csv|docx?|xlsx?|pptx?|rtf|json|md)\b/giu
+    ) || [];
+    return [...new Set(names.map(name => name.toLowerCase()))].sort();
+  }
+
+  function chatGPTAttachmentUserSignature(message) {
+    if (message?.role !== "user") return "";
+    const names = chatGPTAttachmentIdentityKeys(
+      String(message.text || "") + " " + String(message.html || "")
+    );
+    // Two separate file names are required, so a generic reused attachment
+    // (e.g. "report.pdf") cannot align two different conversations.
+    return names.length >= 2 ? names.join("\u001f") : "";
+  }
+
+  function chatGPTRenderedUserAttachmentSignature(node) {
+    const names = chatGPTAttachmentIdentityKeys(node?.innerText || node?.textContent || "");
+    return names.length >= 2 ? names.join("\u001f") : "";
+  }
+
   function matchedChatGPTLiveAssistantTurns(apiMessages, liveNodes) {
     const pairs = new Map();
     if (!apiMessages?.length || !liveNodes?.length) return pairs;
@@ -790,6 +816,47 @@
       if (!userGroup || assistantGroup !== userGroup) continue;
       const matched = findMatchedAssistantInRun(apiMessages, apiIndex + 1, liveNodes[domIndex + 1]);
       if (matched >= 0) pairs.set(matched, liveNodes[domIndex + 1]);
+    }
+    // Attachment-only/attachment-heavy user requests may render as several
+    // file cards with UI labels; their visible text is not exactly the same
+    // string as metadata text. Accept only a UNIQUE two-file signature in
+    // BOTH sources, a single grouped user/assistant exchange, and two
+    // substantial matching prose anchors from the actual assistant content.
+    // No positional guess or common single filename can authorize an overlay.
+    const apiAttachmentUsers = new Map(), domAttachmentUsers = new Map();
+    apiMessages.forEach((message, index) => {
+      const signature = chatGPTAttachmentUserSignature(message);
+      if (signature) {
+        if (!apiAttachmentUsers.has(signature)) apiAttachmentUsers.set(signature, []);
+        apiAttachmentUsers.get(signature).push(index);
+      }
+    });
+    liveNodes.forEach((node, index) => {
+      if (roles[index] !== "user") return;
+      const signature = chatGPTRenderedUserAttachmentSignature(node);
+      if (signature) {
+        if (!domAttachmentUsers.has(signature)) domAttachmentUsers.set(signature, []);
+        domAttachmentUsers.get(signature).push(index);
+      }
+    });
+    for (const [signature, indexes] of apiAttachmentUsers) {
+      const liveIndexes = domAttachmentUsers.get(signature) || [];
+      if (indexes.length !== 1 || liveIndexes.length !== 1) continue;
+      const apiIndex = indexes[0], domIndex = liveIndexes[0];
+      if (apiMessages[apiIndex + 1]?.role !== "assistant" ||
+          roles[domIndex + 1] !== "assistant") continue;
+      const userGroup = liveNodes[domIndex].closest?.("[data-turn-key]");
+      const assistantGroup = liveNodes[domIndex + 1].closest?.("[data-turn-key]");
+      if (!userGroup || assistantGroup !== userGroup) continue;
+      const matched = findMatchedAssistantInRun(apiMessages, apiIndex + 1, liveNodes[domIndex + 1]);
+      if (matched < 0 || pairs.has(matched)) continue;
+      const content = ADAPTER.findTurn(liveNodes[domIndex + 1]) || liveNodes[domIndex + 1];
+      const overlap = chatGPTAssistantContentOverlap(
+        apiMessages[matched]?.text, content.innerText || content.textContent || ""
+      );
+      if (overlap.total < 2 || overlap.hits < 2 ||
+          overlap.hits < Math.ceil(overlap.total * 0.6)) continue;
+      pairs.set(matched, liveNodes[domIndex + 1]);
     }
     return pairs;
   }
