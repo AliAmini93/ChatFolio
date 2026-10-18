@@ -283,6 +283,14 @@ export function createTurnMediaProcessor({
 
       if (!src && !isUserImage) continue;
 
+      // Citation icons are optional UI ornaments. Do not await 12-second
+      // remote favicon fetches while scanning virtualized ChatGPT messages.
+      // Keep URLs for print; full-size images and uploads still embed normally.
+      if (PLATFORM.id === 'chatgpt' && imageKind === 'export-preview-logo') {
+        if (src) cloneImg.src = absoluteUrl(src) || src;
+        continue;
+      }
+
       if (embedImages) {
         const embedded = PLATFORM.id === 'chatgpt'
           ? await sourceToDataUrl(src, signal)

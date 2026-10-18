@@ -2031,13 +2031,22 @@
       scanProgressPct: null,
       scanMaxMountedTurns: initialNodes.length,
       scanStopReason: "not-needed",
+      scanCaptureMs: 0,
+      scanMaxCaptureMs: 0,
+      scanSerializeMs: 0,
+      scanMaxSerializeMs: 0,
+      scanSerializeAttempts: 0,
+      scanMatchingMs: 0,
+      scanElapsedMs: 0,
       scanRestored: true
     };
     const report = () => console.info(
       "ChatFolio Rich UI QA (counts only):", JSON.stringify(diagnostics)
     );
 
+    const scanStarted = Date.now();
     const captureWindow = async () => {
+      const captureStarted = Date.now();
       throwIfCancelled(session);
       assertSameConversation(session);
       const nodes = getMessageNodes().filter(node =>
@@ -2050,7 +2059,9 @@
         if (key) visitedGroupIds.add(key);
       }
       diagnostics.scanDistinctGroups = visitedGroupIds.size;
+      const matchingStarted = Date.now();
       const pairs = matchedChatGPTLiveAssistantTurns(originals, nodes);
+      diagnostics.scanMatchingMs += Date.now() - matchingStarted;
       for (const [index, node] of pairs) {
         if (snapshots.has(index)) continue;
         const original = originals[index];
@@ -2065,6 +2076,8 @@
           diagnostics.skippedDisconnected++;
           continue;
         }
+        const serializeStarted = Date.now();
+        diagnostics.scanSerializeAttempts++;
         try {
           const rendered = await serializeTurn(
             ADAPTER.findTurn(node), node, "assistant",
@@ -2084,8 +2097,15 @@
           if (isCancelledError(error)) throw error;
           diagnostics.failedCapture++;
           // Report counts, not user content, signed URLs or exception text.
+        } finally {
+          const elapsed = Date.now() - serializeStarted;
+          diagnostics.scanSerializeMs += elapsed;
+          diagnostics.scanMaxSerializeMs = Math.max(diagnostics.scanMaxSerializeMs, elapsed);
         }
       }
+      const captured = Date.now() - captureStarted;
+      diagnostics.scanCaptureMs += captured;
+      diagnostics.scanMaxCaptureMs = Math.max(diagnostics.scanMaxCaptureMs, captured);
     };
 
     // The latest viewport remains useful even if no movable scrollport can be
@@ -2222,6 +2242,7 @@
       collected.imageCount = collected.messages.reduce((sum, message) =>
         sum + Math.max(0, Number(message.imageCount || 0)), 0);
     }
+    diagnostics.scanElapsedMs = Date.now() - scanStarted;
     report();
     return collected;
   }
@@ -6044,6 +6065,14 @@ function createTurnMediaProcessor({
       cloneImg.setAttribute("decoding", "sync");
 
       if (!src && !isUserImage) continue;
+
+      // Citation icons are optional UI ornaments. Do not await 12-second
+      // remote favicon fetches while scanning virtualized ChatGPT messages.
+      // Keep URLs for print; full-size images and uploads still embed normally.
+      if (PLATFORM.id === 'chatgpt' && imageKind === 'export-preview-logo') {
+        if (src) cloneImg.src = absoluteUrl(src) || src;
+        continue;
+      }
 
       if (embedImages) {
         const embedded = PLATFORM.id === 'chatgpt'
