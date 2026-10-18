@@ -991,7 +991,33 @@
       ADAPTER.getRole(node) === "user" || ADAPTER.getRole(node) === "assistant"
     );
     const pairs = matchedChatGPTLiveAssistantTurns(collected.messages, liveNodes);
-    if (!pairs.size) return collected;
+    // Privacy-preserving real-provider QA: numbers only. No authored text,
+    // filenames, message IDs, URLs or excerpts leave this extension console.
+    // Diagnostics are emitted even for zero matches (previously silent).
+    const rawRich = message => /<(?:grid|box|row|CodeBlock|Link|Chart|carousel|card)(?:\s|>)/i
+      .test(String(message?.text || ""));
+    const diagnostics = {
+      apiTurns: collected.messages.length,
+      apiAssistants: collected.messages.filter(message => message.role === "assistant").length,
+      apiRawRich: collected.messages.filter(message => message.role === "assistant" && rawRich(message)).length,
+      mountedTurns: liveNodes.length,
+      mountedAssistants: liveNodes.filter(node => ADAPTER.getRole(node) === "assistant").length,
+      matchedAssistants: pairs.size,
+      matchedRawRich: [...pairs.keys()].filter(index => rawRich(collected.messages[index])).length,
+      enrichedAssistants: 0,
+      enrichedRawRich: 0,
+      skippedApiMedia: 0,
+      skippedDisconnected: 0,
+      skippedShortLiveText: 0,
+      failedCapture: 0
+    };
+    const report = () => console.info(
+      "ChatFolio Rich UI QA (counts only):", JSON.stringify(diagnostics)
+    );
+    if (!pairs.size) {
+      report();
+      return collected;
+    }
     const originalMessages = [...collected.messages];
     let replacements = 0;
     for (const [index, node] of pairs) {
@@ -1000,8 +1026,15 @@
       const original = collected.messages[index];
       // An API-sourced image may have authentication/metadata unavailable to
       // the live DOM. Never throw it away as part of a visual enhancement.
-      if (original.role !== "assistant" || Number(original.imageCount || 0) > 0 ||
-          !node.isConnected) continue;
+      if (original.role !== "assistant") continue;
+      if (Number(original.imageCount || 0) > 0) {
+        diagnostics.skippedApiMedia++;
+        continue;
+      }
+      if (!node.isConnected) {
+        diagnostics.skippedDisconnected++;
+        continue;
+      }
       try {
         const turn = ADAPTER.findTurn(node);
         const rendered = await serializeTurn(
@@ -1013,7 +1046,10 @@
         const source = comparableChatGPTTurnText(original.text);
         // A substantially truncated live reply must not replace the complete
         // API response. Markup source can be longer than displayed text.
-        if (!visible || (source.length > 240 && visible.length < Math.min(60, source.length * 0.1))) continue;
+        if (!visible || (source.length > 240 && visible.length < Math.min(60, source.length * 0.1))) {
+          diagnostics.skippedShortLiveText++;
+          continue;
+        }
         collected.messages[index] = {
           ...original,
           html: rendered.html,
@@ -1021,8 +1057,10 @@
           imageCount: Math.max(0, Number(rendered.imageCount || 0))
         };
         replacements += 1;
+        if (rawRich(original)) diagnostics.enrichedRawRich++;
       } catch (error) {
         if (isCancelledError(error)) throw error;
+        diagnostics.failedCapture++;
         // A rich snapshot is an optional fidelity enhancement, never a
         // reason to discard the already complete ordered metadata response.
         console.info("ChatFolio: retaining full ChatGPT metadata response; rich DOM capture unavailable.",
@@ -1035,6 +1073,8 @@
         sum + Math.max(0, Number(message.imageCount || 0)), 0);
       console.info("ChatFolio: enriched safely matched ChatGPT turns with rendered-page content:", replacements);
     }
+    diagnostics.enrichedAssistants = replacements;
+    report();
     return collected;
   }
 
