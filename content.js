@@ -1762,6 +1762,49 @@
     return pairs;
   }
 
+
+  function confirmedRenderedAssistantDuplicate(apiText, visibleText) {
+    // Only consider a rich markup source fragment, not ordinary repeated prose.
+    // The mounted assistant surface may contain the fully assembled final
+    // response while a later metadata message holds that same raw DIL source.
+    const raw = String(apiText || "");
+    if (!/<(?:grid|grid-item|box|row|CodeBlock|Link|title|caption|badge|table|Chart|AsyncImage)\b/i.test(raw)) return false;
+    const visible = comparableChatGPTTurnText(visibleText).replace(/[*_~]/g, "");
+    const anchors = [...new Set(raw.split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line => !/[<>{}]/.test(line) && !/^(?:bash |npm |git |echo |[-*+] )/.test(line))
+      .map(line => comparableChatGPTTurnText(line.replace(/[*_~]/g, "")))
+      .filter(line => line.length >= 65)
+      .map(line => line.slice(0, 78)))];
+    if (anchors.length < 2) return false;
+    const hits = anchors.filter(anchor => visible.includes(anchor)).length;
+    return hits >= 2 && hits >= Math.ceil(anchors.length * 0.75);
+  }
+
+  function pruneProvenRenderedAssistantDuplicates(collected, pairs, originals) {
+    // Omit a later assistant only when an earlier response in the same
+    // uninterrupted assistant run was enriched from a stable DOM match and
+    // substantial prose from the later raw DIL item is already visible.
+    // Preserve unmatched progress, distinct replies and API-only media.
+    const skip = new Set();
+    for (const [index] of pairs) {
+      const enriched = collected.messages[index];
+      if (!enriched || enriched === originals[index]) continue;
+      for (let next = index + 1; next < collected.messages.length; next++) {
+        const candidate = collected.messages[next];
+        if (candidate.role !== "assistant" || pairs.has(next)) break;
+        if (Number(candidate.imageCount || 0) !== 0) continue;
+        if (confirmedRenderedAssistantDuplicate(originals[next]?.text, enriched.text)) {
+          skip.add(next);
+        }
+      }
+    }
+    if (skip.size) {
+      collected.messages = collected.messages.filter((_, index) => !skip.has(index));
+      console.info("ChatFolio: omitted verified duplicate raw Rich UI metadata segments:", skip.size);
+    }
+  }
+
   async function enhanceChatGPTMetadataWithRenderedDom(collected, options, session) {
     if (PLATFORM.id !== "chatgpt" || collected?.extractionSource !== "metadata" ||
         !Array.isArray(collected.messages) || !collected.messages.length) return collected;
@@ -1770,6 +1813,7 @@
     );
     const pairs = matchedChatGPTLiveAssistantTurns(collected.messages, liveNodes);
     if (!pairs.size) return collected;
+    const originalMessages = [...collected.messages];
     let replacements = 0;
     for (const [index, node] of pairs) {
       throwIfCancelled(session);
@@ -1807,6 +1851,7 @@
       }
     }
     if (replacements) {
+      pruneProvenRenderedAssistantDuplicates(collected, pairs, originalMessages);
       collected.imageCount = collected.messages.reduce((sum, message) =>
         sum + Math.max(0, Number(message.imageCount || 0)), 0);
       console.info("ChatFolio: enriched safely matched ChatGPT turns with rendered-page content:", replacements);
