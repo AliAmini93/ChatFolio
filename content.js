@@ -2006,6 +2006,7 @@
     const rawRich = message => /<(?:grid|box|row|CodeBlock|Link|Chart|carousel|card)(?:\s|>)/i
       .test(String(message?.text || ""));
     const snapshots = new Map();
+    const visitedGroupIds = new Set();
     const initialNodes = getMessageNodes().filter(node =>
       ADAPTER.getRole(node) === "user" || ADAPTER.getRole(node) === "assistant"
     );
@@ -2026,6 +2027,8 @@
       scanWindows: 0,
       scanSteps: 0,
       scanTopWaitRounds: 0,
+      scanDistinctGroups: 0,
+      scanProgressPct: null,
       scanMaxMountedTurns: initialNodes.length,
       scanStopReason: "not-needed",
       scanRestored: true
@@ -2042,6 +2045,11 @@
       );
       diagnostics.scanWindows++;
       diagnostics.scanMaxMountedTurns = Math.max(diagnostics.scanMaxMountedTurns, nodes.length);
+      for (const node of nodes) {
+        const key = node.closest?.("[data-turn-key]")?.getAttribute?.("data-turn-key");
+        if (key) visitedGroupIds.add(key);
+      }
+      diagnostics.scanDistinctGroups = visitedGroupIds.size;
       const pairs = matchedChatGPTLiveAssistantTurns(originals, nodes);
       for (const [index, node] of pairs) {
         if (snapshots.has(index)) continue;
@@ -2139,7 +2147,7 @@
             await sleepWithAbort(300, session.controller.signal);
           }
           let stuck = 0;
-          for (let step = 0; step < 72 && Date.now() - started < 35000; step++) {
+          for (let step = 0; step < 180 && Date.now() - started < 90000; step++) {
             throwIfCancelled(session);
             assertSameConversation(session);
             await captureWindow();
@@ -2171,8 +2179,13 @@
               break;
             }
           }
-          if (Date.now() - started >= 35000) diagnostics.scanStopReason = "time-budget";
+          if (Date.now() - started >= 90000) diagnostics.scanStopReason = "time-budget";
           await captureWindow();
+          const finalRange = scrollRange(scroller);
+          diagnostics.scanProgressPct = finalRange > 0
+            ? Math.max(0, Math.min(100,
+                Math.round(getScrollTop(scroller) * 100 / finalRange)))
+            : 100;
         } finally {
           // Always put the user's scroll position and inline styling back,
           // including Stop, provider navigation or a failed media snapshot.

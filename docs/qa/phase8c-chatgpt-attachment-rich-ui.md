@@ -214,3 +214,29 @@ of recovery of every historic real-provider widget.
 
 Continue to block merge and stable release until the user's newer
 real PDF passes both visual parity and the existing QA matrix.
+
+
+## Phase 8D follow-up: 122-turn step-budget diagnostic (awaiting live retest)
+
+The next real Ubuntu run at `cc7c876` passed 83 Node, 34 Chromium,
+reproducible ZIP and release gate. The actual 122-message console counters
+reported `enrichedRawRich=9` (previously 5), `scanSteps=72`,
+`scanWindows=80`, `scanStopReason=step-budget`, `scanRestored=true`,
+and `failedCapture=0`. The step cap was exhausted; that **does not**
+prove that every remaining raw Rich UI indicator is renderable or that
+matching is correct. This is a private real-user diagnostic, not a pass.
+
+In this bounded follow-up, increase the maximum traversal from 72 steps
+and 35 seconds to 180 steps and 90 seconds, retaining the small overlapping
+viewport stride, cancellation checks, identity matching, serialization
+safeguards and scroll/style restoration. Add privacy-safe, numeric-only
+`scanDistinctGroups` (mounted turn-group IDs counted in memory but never
+logged) and `scanProgressPct` (final scroller position before restoring).
+A new 50-group virtualized fixture requires more than 72 traversal steps,
+validates every formatted table and PDF link, and checks restoration.
+
+**Do not merge or release yet.** Retest the same live conversation on the
+exact new SHA; inspect a fresh PDF and counters. If scan reaches near 100%
+but fewer rich responses are restored, investigate matching/availability
+rather than raising budgets again. Source content and private QA outputs
+must not enter the repository.
