@@ -86,6 +86,9 @@ with sync_playwright() as playwright:
     )
     try:
         page = chrome.new_page()
+        summary_logs = []
+        page.on("console", lambda message: summary_logs.append(message.text)
+                if "ChatFolio Rich UI QA (counts only):" in message.text else None)
         page.set_content("<main></main>")
         page.evaluate("""() => {window.chrome = {runtime: {
           getManifest: () => ({version:"1.8.11"}),
@@ -101,6 +104,9 @@ with sync_playwright() as playwright:
             ).keys()]""", api)
         assert pairs == [3], pairs
         enhanced = page.evaluate(call, api)
+        assert summary_logs and '"apiTurns":4' in summary_logs[-1], summary_logs
+        assert '"enrichedRawRich":1' in summary_logs[-1], summary_logs[-1]
+        assert not any(prose[0] in line or long_input in line for line in summary_logs)
         assert len(enhanced) == len(api)
         assert [x["key"] for x in enhanced] == [x["key"] for x in api]
         assert [x["html"] for x in enhanced[:3]] == [x["html"] for x in api[:3]]
