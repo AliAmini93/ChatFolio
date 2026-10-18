@@ -987,100 +987,188 @@
   async function enhanceChatGPTMetadataWithRenderedDom(collected, options, session) {
     if (PLATFORM.id !== "chatgpt" || collected?.extractionSource !== "metadata" ||
         !Array.isArray(collected.messages) || !collected.messages.length) return collected;
-    const liveNodes = getMessageNodes().filter(node =>
-      ADAPTER.getRole(node) === "user" || ADAPTER.getRole(node) === "assistant"
-    );
-    const pairs = matchedChatGPTLiveAssistantTurns(collected.messages, liveNodes);
-    // Privacy-preserving real-provider QA: numbers only. No authored text,
-    // filenames, message IDs, URLs or excerpts leave this extension console.
-    // Diagnostics are emitted even for zero matches (previously silent).
+
+    // Keep immutable API metadata as the identity/order authority throughout
+    // the scan. Detached snapshots must be serialized BEFORE virtualized DOM
+    // nodes are removed, then applied at their original API indexes.
+    const originals = [...collected.messages];
     const rawRich = message => /<(?:grid|box|row|CodeBlock|Link|Chart|carousel|card)(?:\s|>)/i
       .test(String(message?.text || ""));
+    const snapshots = new Map();
+    const initialNodes = getMessageNodes().filter(node =>
+      ADAPTER.getRole(node) === "user" || ADAPTER.getRole(node) === "assistant"
+    );
     const diagnostics = {
-      apiTurns: collected.messages.length,
-      apiAssistants: collected.messages.filter(message => message.role === "assistant").length,
-      apiRawRich: collected.messages.filter(message => message.role === "assistant" && rawRich(message)).length,
-      mountedTurns: liveNodes.length,
-      mountedAssistants: liveNodes.filter(node => ADAPTER.getRole(node) === "assistant").length,
-      matchedAssistants: pairs.size,
-      matchedRawRich: [...pairs.keys()].filter(index => rawRich(collected.messages[index])).length,
+      apiTurns: originals.length,
+      apiAssistants: originals.filter(message => message.role === "assistant").length,
+      apiRawRich: originals.filter(message => message.role === "assistant" && rawRich(message)).length,
+      mountedTurns: initialNodes.length,
+      mountedAssistants: initialNodes.filter(node => ADAPTER.getRole(node) === "assistant").length,
+      matchedAssistants: 0,
+      matchedRawRich: 0,
       enrichedAssistants: 0,
       enrichedRawRich: 0,
       skippedApiMedia: 0,
       skippedDisconnected: 0,
       skippedShortLiveText: 0,
-      failedCapture: 0
+      failedCapture: 0,
+      scanWindows: 0,
+      scanRestored: true
     };
     const report = () => console.info(
       "ChatFolio Rich UI QA (counts only):", JSON.stringify(diagnostics)
     );
-    if (!pairs.size) {
-      report();
-      return collected;
-    }
-    const originalMessages = [...collected.messages];
-    let replacements = 0;
-    for (const [index, node] of pairs) {
+
+    const captureWindow = async () => {
       throwIfCancelled(session);
       assertSameConversation(session);
-      const original = collected.messages[index];
-      // An API-sourced image may have authentication/metadata unavailable to
-      // the live DOM. Never throw it away as part of a visual enhancement.
-      if (original.role !== "assistant") continue;
-      if (Number(original.imageCount || 0) > 0) {
-        diagnostics.skippedApiMedia++;
-        continue;
-      }
-      if (!node.isConnected) {
-        diagnostics.skippedDisconnected++;
-        continue;
-      }
-      try {
-        const turn = ADAPTER.findTurn(node);
-        const rendered = await serializeTurn(
-          turn, node, "assistant", options.embedImages !== false, session.controller.signal
-        );
-        throwIfCancelled(session);
-        assertSameConversation(session);
-        const visible = comparableChatGPTTurnText(rendered.text);
-        const source = comparableChatGPTTurnText(original.text);
-        // A substantially truncated live reply must not replace the complete
-        // API response. Markup source can be longer than displayed text.
-        if (!visible || (source.length > 240 && visible.length < Math.min(60, source.length * 0.1))) {
-          diagnostics.skippedShortLiveText++;
+      const nodes = getMessageNodes().filter(node =>
+        ADAPTER.getRole(node) === "user" || ADAPTER.getRole(node) === "assistant"
+      );
+      diagnostics.scanWindows++;
+      const pairs = matchedChatGPTLiveAssistantTurns(originals, nodes);
+      for (const [index, node] of pairs) {
+        if (snapshots.has(index)) continue;
+        const original = originals[index];
+        if (original?.role !== "assistant") continue;
+        // Do not replace authenticated API-only media with a partial
+        // screenshot of a temporarily mounted provider page.
+        if (Number(original.imageCount || 0) > 0) {
+          diagnostics.skippedApiMedia++;
           continue;
         }
-        collected.messages[index] = {
-          ...original,
-          html: rendered.html,
-          text: rendered.text,
-          imageCount: Math.max(0, Number(rendered.imageCount || 0))
-        };
-        replacements += 1;
-        if (rawRich(original)) diagnostics.enrichedRawRich++;
+        if (!node.isConnected) {
+          diagnostics.skippedDisconnected++;
+          continue;
+        }
+        try {
+          const rendered = await serializeTurn(
+            ADAPTER.findTurn(node), node, "assistant",
+            options.embedImages !== false, session.controller.signal
+          );
+          throwIfCancelled(session);
+          assertSameConversation(session);
+          const visible = comparableChatGPTTurnText(rendered.text);
+          const source = comparableChatGPTTurnText(original.text);
+          if (!visible || (source.length > 240 &&
+              visible.length < Math.min(60, source.length * 0.1))) {
+            diagnostics.skippedShortLiveText++;
+            continue;
+          }
+          snapshots.set(index, rendered);
+        } catch (error) {
+          if (isCancelledError(error)) throw error;
+          diagnostics.failedCapture++;
+          // Report counts, not user content, signed URLs or exception text.
+        }
+      }
+    };
+
+    // The latest viewport remains useful even if no movable scrollport can be
+    // found. Browsers that virtualize the thread may mount only 4 of 86
+    // assistant nodes; scan their scrollport in bounded incremental windows.
+    await captureWindow();
+    if (diagnostics.apiRawRich && initialNodes.length < originals.length &&
+        snapshots.size < diagnostics.apiRawRich && initialNodes.length >= 2) {
+      let scroller = null;
+      try {
+        scroller = await resolveConversationScrollContainer(
+          initialNodes[0], "chatgpt", session.controller.signal
+        );
       } catch (error) {
         if (isCancelledError(error)) throw error;
-        diagnostics.failedCapture++;
-        // A rich snapshot is an optional fidelity enhancement, never a
-        // reason to discard the already complete ordered metadata response.
-        console.info("ChatFolio: retaining full ChatGPT metadata response; rich DOM capture unavailable.",
-          error?.message || String(error));
+      }
+      if (scroller && scrollRange(scroller) > 24) {
+        const originalTop = getScrollTop(scroller);
+        const prior = {
+          behavior: scroller.style.getPropertyValue("scroll-behavior"),
+          behaviorPriority: scroller.style.getPropertyPriority("scroll-behavior"),
+          anchor: scroller.style.getPropertyValue("overflow-anchor"),
+          anchorPriority: scroller.style.getPropertyPriority("overflow-anchor"),
+          snap: scroller.style.getPropertyValue("scroll-snap-type"),
+          snapPriority: scroller.style.getPropertyPriority("scroll-snap-type")
+        };
+        const started = Date.now();
+        const restore = (property, value, priority) => {
+          if (value) scroller.style.setProperty(property, value, priority);
+          else scroller.style.removeProperty(property);
+        };
+        try {
+          scroller.style.setProperty("scroll-behavior", "auto", "important");
+          scroller.style.setProperty("overflow-anchor", "none", "important");
+          scroller.style.setProperty("scroll-snap-type", "none", "important");
+          setScrollTop(scroller, 0);
+          await sleepWithAbort(240, session.controller.signal);
+          // Prepending older messages may continue briefly after reaching top.
+          for (let round = 0; round < 3; round++) {
+            await captureWindow();
+            setScrollTop(scroller, 0);
+            await sleepWithAbort(200, session.controller.signal);
+          }
+          let stuck = 0;
+          for (let step = 0; step < 72 && Date.now() - started < 35000; step++) {
+            throwIfCancelled(session);
+            assertSameConversation(session);
+            await captureWindow();
+            const top = getScrollTop(scroller);
+            const range = scrollRange(scroller);
+            const viewport = getClientHeight(scroller);
+            if (range <= 24) break;
+            const target = Math.min(range, top + Math.max(200, viewport * 0.55));
+            if (target <= top + 3) {
+              stuck++;
+              if (stuck >= 3) break;
+              await sleepWithAbort(260, session.controller.signal);
+              continue;
+            }
+            setScrollTop(scroller, target);
+            await sleepWithAbort(230, session.controller.signal);
+            const moved = getScrollTop(scroller);
+            if (Math.abs(moved - top) <= 3) stuck++;
+            else stuck = 0;
+            if (stuck >= 4) break;
+          }
+          await captureWindow();
+        } finally {
+          // Always put the user's scroll position and inline styling back,
+          // including Stop, provider navigation or a failed media snapshot.
+          try {
+            setScrollTop(scroller, originalTop);
+            restore("scroll-behavior", prior.behavior, prior.behaviorPriority);
+            restore("overflow-anchor", prior.anchor, prior.anchorPriority);
+            restore("scroll-snap-type", prior.snap, prior.snapPriority);
+          } catch {
+            diagnostics.scanRestored = false;
+          }
+        }
       }
     }
-    if (replacements) {
-      pruneProvenRenderedAssistantDuplicates(collected, pairs, originalMessages);
+
+    const applied = new Map();
+    for (const [index, rendered] of snapshots) {
+      collected.messages[index] = {
+        ...originals[index],
+        html: rendered.html,
+        text: rendered.text,
+        imageCount: Math.max(0, Number(rendered.imageCount || 0))
+      };
+      applied.set(index, true);
+    }
+    diagnostics.matchedAssistants = applied.size;
+    diagnostics.matchedRawRich = [...applied.keys()].filter(index => rawRich(originals[index])).length;
+    diagnostics.enrichedAssistants = applied.size;
+    diagnostics.enrichedRawRich = diagnostics.matchedRawRich;
+    if (applied.size) {
+      // Prune only previously corroborated raw Rich UI duplicates, after all
+      // snapshot indexes have been resolved against the original API array.
+      pruneProvenRenderedAssistantDuplicates(collected, applied, originals);
       collected.imageCount = collected.messages.reduce((sum, message) =>
         sum + Math.max(0, Number(message.imageCount || 0)), 0);
-      console.info("ChatFolio: enriched safely matched ChatGPT turns with rendered-page content:", replacements);
     }
-    diagnostics.enrichedAssistants = replacements;
     report();
     return collected;
   }
 
-  // ChatGPT can have tall wrappers (scrollHeight > clientHeight) that are NOT
-  // scrollports. A candidate is usable only when its scroll actually moves the
-  // authored conversation. Never fall back to the largest scrollHeight alone.
   function collectScrollCandidates(messageNode, platformId = PLATFORM.id) {
     const list = [];
     const add = (node) => {
