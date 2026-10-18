@@ -758,8 +758,16 @@
   }
 
   function chatGPTRenderedUserAttachmentSignature(node) {
-    const names = chatGPTAttachmentIdentityKeys(node?.innerText || node?.textContent || "");
-    return names.length >= 2 ? names.join("\u001f") : "";
+    // Card labels and file names may be concatenated in innerText without a
+    // separator (e.g. "Documentexample.pdf"). Read authored leaf text
+    // individually before falling back to the whole bubble's visible text.
+    const leafNames = [...(node?.querySelectorAll?.("*") || [])]
+      .filter(element => element.childElementCount === 0)
+      .flatMap(element => chatGPTAttachmentIdentityKeys(element.textContent));
+    const names = [...new Set(leafNames)].sort();
+    const resolved = names.length >= 2 ? names :
+      chatGPTAttachmentIdentityKeys(node?.innerText || node?.textContent || "");
+    return resolved.length >= 2 ? resolved.join("\u001f") : "";
   }
 
   function matchedChatGPTLiveAssistantTurns(apiMessages, liveNodes) {
