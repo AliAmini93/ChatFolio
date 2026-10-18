@@ -1678,6 +1678,142 @@
     };
   }
 
+
+  // Phase 8B: metadata is authoritative for message count and branch ordering,
+  // but its plain-text part strings do not contain the rendered ChatGPT Rich UI
+  // (tables, link cards, formatted responses, DIL components). Where live
+  // authored DOM can be associated with a particular API turn unambiguously,
+  // use its already-sanitized printable markup while retaining the API list.
+  // Never infer a missing turn from the live DOM or reorder metadata.
+  function comparableChatGPTTurnText(value) {
+    return normalizeText(value || "")
+      .replace(/[\u200c\u200d\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function sameChatGPTUserTurn(apiTurn, domNode) {
+    if (apiTurn?.role !== "user" || ADAPTER.getRole(domNode) !== "user") return false;
+    const original = comparableChatGPTTurnText(apiTurn.text);
+    const visible = comparableChatGPTTurnText(domNode?.innerText || domNode?.textContent);
+    // Exact user text is a stronger anchor than an ordinal / assistant label.
+    // Never match tiny generic fragments or truncated DOM user messages.
+    if (!original || !visible) return false;
+    return original === visible || (
+      original.length >= 32 && visible.length >= 32 &&
+      original.includes(visible) && visible.length >= original.length * 0.85
+    );
+  }
+
+  function matchedChatGPTLiveAssistantTurns(apiMessages, liveNodes) {
+    const pairs = new Map();
+    if (!apiMessages?.length || !liveNodes?.length) return pairs;
+    const roles = liveNodes.map(node => ADAPTER.getRole(node));
+    const complete = liveNodes.length === apiMessages.length &&
+      apiMessages.every((message, index) => message.role === roles[index]);
+    if (complete) {
+      const eligibleUsers = apiMessages.map((message, index) =>
+        message.role === "user" && comparableChatGPTTurnText(message.text).length > 0 ? index : -1
+      ).filter(index => index >= 0);
+      const correctUsers = eligibleUsers.filter(index =>
+        sameChatGPTUserTurn(apiMessages[index], liveNodes[index]));
+      // Without multiple correct anchors an equal-length DOM may represent a
+      // different branch; do not overlay an unrelated response.
+      const minimum = Math.min(eligibleUsers.length, 2);
+      if (minimum > 0 && correctUsers.length >= minimum &&
+          correctUsers.length >= Math.ceil(eligibleUsers.length * 0.8)) {
+        for (let index = 0; index < apiMessages.length; index++) {
+          if (roles[index] === "assistant") pairs.set(index, liveNodes[index]);
+        }
+        return pairs;
+      }
+    }
+
+    // Current ChatGPT groups each user bubble with its next assistant response.
+    // In virtualized history, align only a *unique* exact user message in both
+    // lists and its assistant sibling from the SAME [data-turn-key] group.
+    // This conservative partial path never attaches an answer by role alone.
+    const apiUsers = new Map();
+    const domUsers = new Map();
+    const add = (map, key, index) => {
+      if (!key || key.length < 3) return;
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(index);
+    };
+    apiMessages.forEach((message, index) => {
+      if (message.role === "user") add(apiUsers, comparableChatGPTTurnText(message.text), index);
+    });
+    liveNodes.forEach((node, index) => {
+      if (roles[index] === "user") {
+        add(domUsers, comparableChatGPTTurnText(node.innerText || node.textContent), index);
+      }
+    });
+    for (const [text, indexes] of apiUsers) {
+      const liveIndexes = domUsers.get(text) || [];
+      if (indexes.length !== 1 || liveIndexes.length !== 1) continue;
+      const apiIndex = indexes[0], domIndex = liveIndexes[0];
+      if (apiMessages[apiIndex + 1]?.role !== "assistant" ||
+          roles[domIndex + 1] !== "assistant") continue;
+      const userGroup = liveNodes[domIndex].closest?.("[data-turn-key]");
+      const assistantGroup = liveNodes[domIndex + 1].closest?.("[data-turn-key]");
+      if (!userGroup || assistantGroup !== userGroup) continue;
+      pairs.set(apiIndex + 1, liveNodes[domIndex + 1]);
+    }
+    return pairs;
+  }
+
+  async function enhanceChatGPTMetadataWithRenderedDom(collected, options, session) {
+    if (PLATFORM.id !== "chatgpt" || collected?.extractionSource !== "metadata" ||
+        !Array.isArray(collected.messages) || !collected.messages.length) return collected;
+    const liveNodes = getMessageNodes().filter(node =>
+      ADAPTER.getRole(node) === "user" || ADAPTER.getRole(node) === "assistant"
+    );
+    const pairs = matchedChatGPTLiveAssistantTurns(collected.messages, liveNodes);
+    if (!pairs.size) return collected;
+    let replacements = 0;
+    for (const [index, node] of pairs) {
+      throwIfCancelled(session);
+      assertSameConversation(session);
+      const original = collected.messages[index];
+      // An API-sourced image may have authentication/metadata unavailable to
+      // the live DOM. Never throw it away as part of a visual enhancement.
+      if (original.role !== "assistant" || Number(original.imageCount || 0) > 0 ||
+          !node.isConnected) continue;
+      try {
+        const turn = ADAPTER.findTurn(node);
+        const rendered = await serializeTurn(
+          turn, node, "assistant", options.embedImages !== false, session.controller.signal
+        );
+        throwIfCancelled(session);
+        assertSameConversation(session);
+        const visible = comparableChatGPTTurnText(rendered.text);
+        const source = comparableChatGPTTurnText(original.text);
+        // A substantially truncated live reply must not replace the complete
+        // API response. Markup source can be longer than displayed text.
+        if (!visible || (source.length > 240 && visible.length < Math.min(60, source.length * 0.1))) continue;
+        collected.messages[index] = {
+          ...original,
+          html: rendered.html,
+          text: rendered.text,
+          imageCount: Math.max(0, Number(rendered.imageCount || 0))
+        };
+        replacements += 1;
+      } catch (error) {
+        if (isCancelledError(error)) throw error;
+        // A rich snapshot is an optional fidelity enhancement, never a
+        // reason to discard the already complete ordered metadata response.
+        console.info("ChatFolio: retaining full ChatGPT metadata response; rich DOM capture unavailable.",
+          error?.message || String(error));
+      }
+    }
+    if (replacements) {
+      collected.imageCount = collected.messages.reduce((sum, message) =>
+        sum + Math.max(0, Number(message.imageCount || 0)), 0);
+      console.info("ChatFolio: enriched safely matched ChatGPT turns with rendered-page content:", replacements);
+    }
+    return collected;
+  }
+
   // ChatGPT can have tall wrappers (scrollHeight > clientHeight) that are NOT
   // scrollports. A candidate is usable only when its scroll actually moves the
   // authored conversation. Never fall back to the largest scrollHeight alone.
@@ -1919,6 +2055,9 @@
       }
 
       if (!collected?.messages?.length) throw new Error("The semantic full-chat collector did not find any messages.");
+      if (PLATFORM.id === "chatgpt" && collected.extractionSource === "metadata") {
+        collected = await enhanceChatGPTMetadataWithRenderedDom(collected, options, session);
+      }
     } catch (error) {
       if (isCancelledError(error)) throw error;
       // Opening Assisted Visual Backup as a surprise after a scroll failure
