@@ -694,6 +694,43 @@
     );
   }
 
+
+  function chatGPTAssistantContentOverlap(apiText, renderedText) {
+    // Deliberately use only substantial natural-language prose, not tags,
+    // markup attributes, code snippets, labels, generic "PASS" or headings.
+    // This is an identity check, not a general semantic similarity matcher.
+    const candidateLines = String(apiText || "").split(/\r?\n/)
+      .map(line => line.trim().replace(/^#{1,6}\s+/, "").replace(/\*\*/g, ""))
+      .filter(line => line.length >= 60 && !/[<>{}]/.test(line))
+      .filter(line => !/^(?:[-+*]\s|bash\b|npm\b|git\b|echo\b|PY=|EXPECTED=|cd\b)/.test(line))
+      .map(line => comparableChatGPTTurnText(line).slice(0, 55));
+    const anchors = [...new Set(candidateLines)].slice(0, 16);
+    if (anchors.length < 2) return { hits: 0, total: anchors.length };
+    const visible = comparableChatGPTTurnText(renderedText).replace(/\*\*/g, "");
+    return { hits: anchors.filter(anchor => visible.includes(anchor)).length, total: anchors.length };
+  }
+
+  function findMatchedAssistantInRun(apiMessages, startIndex, liveAssistantNode) {
+    let end = startIndex;
+    while (end < apiMessages.length && apiMessages[end]?.role === "assistant") end++;
+    if (end === startIndex + 1) return startIndex;
+    const renderedText = liveAssistantNode?.innerText || liveAssistantNode?.textContent || "";
+    const scores = [];
+    for (let i = startIndex; i < end; i++) {
+      const overlap = chatGPTAssistantContentOverlap(apiMessages[i]?.text, renderedText);
+      scores.push({ index: i, ...overlap });
+    }
+    const qualifying = scores.filter(score =>
+      score.total >= 2 && score.hits >= 2 &&
+      score.hits >= Math.ceil(score.total * 0.6));
+    if (qualifying.length !== 1) {
+      // In split runs, positional matching is unsafe. Prefer complete API
+      // output over replacing a progress segment with unrelated final HTML.
+      return -1;
+    }
+    return qualifying[0].index;
+  }
+
   function matchedChatGPTLiveAssistantTurns(apiMessages, liveNodes) {
     const pairs = new Map();
     if (!apiMessages?.length || !liveNodes?.length) return pairs;
@@ -746,7 +783,8 @@
       const userGroup = liveNodes[domIndex].closest?.("[data-turn-key]");
       const assistantGroup = liveNodes[domIndex + 1].closest?.("[data-turn-key]");
       if (!userGroup || assistantGroup !== userGroup) continue;
-      pairs.set(apiIndex + 1, liveNodes[domIndex + 1]);
+      const matched = findMatchedAssistantInRun(apiMessages, apiIndex + 1, liveNodes[domIndex + 1]);
+      if (matched >= 0) pairs.set(matched, liveNodes[domIndex + 1]);
     }
     return pairs;
   }
