@@ -799,6 +799,30 @@
     for (let apiIndex = 0; apiIndex < apiMessages.length; apiIndex++) {
       if (apiMessages[apiIndex]?.role !== "assistant" || pairs.has(apiIndex)) continue;
       for (const item of rendered) {
+        // A prose-only identity MUST NOT bypass stricter attachment identity.
+        // File cards can be recognized even when filenames are injected into
+        // the visible bubble with extra UI labels. Missing, mismatched or
+        // duplicated attachment signatures are never acceptable.
+        let precedingUserIndex = apiIndex - 1;
+        while (precedingUserIndex >= 0 &&
+               apiMessages[precedingUserIndex]?.role !== "user") precedingUserIndex--;
+        const apiSignature = chatGPTAttachmentUserSignature(
+          apiMessages[precedingUserIndex]
+        );
+        const mountedUser = item.node.closest("[data-turn-key]")
+          ?.querySelector("[data-user-message-bubble]");
+        const domSignature = chatGPTRenderedUserAttachmentSignature(mountedUser);
+        if (apiSignature || domSignature) {
+          if (!apiSignature || apiSignature !== domSignature) continue;
+          const apiCount = apiMessages.filter(message =>
+            chatGPTAttachmentUserSignature(message) === apiSignature
+          ).length;
+          const domCount = liveNodes.filter((node, index) =>
+            roles[index] === "user" &&
+            chatGPTRenderedUserAttachmentSignature(node) === apiSignature
+          ).length;
+          if (apiCount !== 1 || domCount !== 1) continue;
+        }
         const overlap = chatGPTAssistantContentOverlap(
           apiMessages[apiIndex].text, item.text
         );
