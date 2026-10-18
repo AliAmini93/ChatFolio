@@ -122,3 +122,47 @@ path was used.
 PR remains Draft: do not merge or publish a stable release until a real
 PDF again shows the last relevant reply with a rendered link/table/code
 block, preserves prior images/links, and does not lose any message.
+
+## Phase 8D: bounded virtualized DOM traversal (experimental)
+
+The real numerical browser report was:
+
+```json
+{"apiTurns":112,"apiAssistants":86,"apiRawRich":36,
+ "mountedTurns":6,"mountedAssistants":4,
+ "matchedAssistants":1,"enrichedAssistants":1,"failedCapture":0}
+```
+
+This confirms that the immediate DOM cannot supply rich HTML for the
+majority of the full metadata-backed conversation. Earlier matching
+heuristics alone cannot solve this availability problem.
+
+For ChatGPT metadata exports, the code now first captures the currently
+mounted responses and, **only when raw Rich UI exists and the DOM is
+partial**, probes for a scroller linked to authored conversation turns.
+It performs a bounded traversal from the start of the conversation,
+serializing safely matched assistant DOM snapshots *before* the browser
+unmounts them. It uses the original API ordering and message identities,
+applies snapshots only to their independently matched indexes, and finally
+restores the original scroll position, scroll anchoring, snapping and
+behavior. Other providers, private chat content and manifest permissions
+are unchanged.
+
+The traversal is capped at 72 scroll steps and 35 seconds; it can recover
+many but not necessarily all historical Rich UI surfaces. A missing real
+scrollport or ambiguous user/assistant identity falls back to complete
+API text rather than inventing links/images or dropping messages. Stop
+and navigation cancellation continue to apply. Full fidelity cannot be
+asserted when ChatGPT no longer mounts the original Rich UI or exposes
+only raw component source.
+
+A new Chromium regression mounts only two of nine turns at a time
+and checks that all nine rendered tables and clickable PDF links are
+recovered in a real PDF, preserving 18 API turns, their order and the
+original scroll position. Numeric-only QA diagnostics now include
+`scanWindows` and `scanRestored`.
+
+**Real-provider acceptance is still required** before merging. Repeat
+an export of the user's 112-turn example, send only numeric console
+counters, and compare recent and older formatted replies and embedded
+images/links. No private chat, PDF or browser profile is committed.
