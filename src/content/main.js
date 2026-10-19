@@ -996,6 +996,7 @@
       .test(String(message?.text || ""));
     const snapshots = new Map();
     const visitedGroupIds = new Set();
+    let previousFirstGroupKey = "";
     const observedAssistantGroups = new Set();
     const matchedAssistantGroups = new Set();
     const initialNodes = getMessageNodes().filter(node =>
@@ -1003,6 +1004,7 @@
     );
     const diagnostics = {
       apiTurns: originals.length,
+      apiUserTurns: originals.filter(message => message.role === "user").length,
       apiAssistants: originals.filter(message => message.role === "assistant").length,
       apiRawRich: originals.filter(message => message.role === "assistant" && rawRich(message)).length,
       mountedTurns: initialNodes.length,
@@ -1019,6 +1021,11 @@
       scanSteps: 0,
       scanTopWaitRounds: 0,
       scanDistinctGroups: 0,
+      scanUserGroupCoveragePct: 0,
+      scanCoverageRetries: 0,
+      scanFrontierChanges: 0,
+      scanScrollerRangeStart: null,
+      scanScrollerRangeEnd: null,
       scanProgressPct: null,
       scanMaxMountedTurns: initialNodes.length,
       scanStopReason: "not-needed",
@@ -1054,6 +1061,11 @@
         if (key) visitedGroupIds.add(key);
       }
       diagnostics.scanDistinctGroups = visitedGroupIds.size;
+      const firstKey = nodes[0]?.closest?.("[data-turn-key]")?.getAttribute?.("data-turn-key") || "";
+      if (firstKey && previousFirstGroupKey && firstKey !== previousFirstGroupKey) {
+        diagnostics.scanFrontierChanges++;
+      }
+      if (firstKey) previousFirstGroupKey = firstKey;
       for (const node of nodes) {
         if (ADAPTER.getRole(node) !== "assistant") continue;
         const key = node.closest?.("[data-turn-key]")?.getAttribute?.("data-turn-key");
@@ -1130,6 +1142,7 @@
       diagnostics.scanStopReason = scroller ? "short-scrollport" : "no-scrollport";
       if (scroller && scrollRange(scroller) > 24) {
         diagnostics.scanStopReason = "step-budget";
+        diagnostics.scanScrollerRangeStart = Math.round(scrollRange(scroller));
         const originalTop = getScrollTop(scroller);
         const prior = {
           behavior: scroller.style.getPropertyValue("scroll-behavior"),
@@ -1188,6 +1201,18 @@
             if (target <= top + 3) {
               stuck++;
               if (stuck >= 3) {
+                // A scrollport ending is not proof that the virtualized chat
+                // mounted every user exchange. Retry its start once to allow
+                // late hydration; report incomplete coverage if still short.
+                if (diagnostics.scanCoverageRetries < 1 &&
+                    visitedGroupIds.size < diagnostics.apiUserTurns) {
+                  diagnostics.scanCoverageRetries++;
+                  stuck = 0;
+                  setScrollTop(scroller, 0);
+                  await sleepWithAbort(750, session.controller.signal);
+                  await captureWindow();
+                  continue;
+                }
                 diagnostics.scanStopReason = "at-scroll-limit";
                 break;
               }
@@ -1207,6 +1232,7 @@
           if (Date.now() - started >= 90000) diagnostics.scanStopReason = "time-budget";
           await captureWindow();
           const finalRange = scrollRange(scroller);
+          diagnostics.scanScrollerRangeEnd = Math.round(finalRange);
           diagnostics.scanProgressPct = finalRange > 0
             ? Math.max(0, Math.min(100,
                 Math.round(getScrollTop(scroller) * 100 / finalRange)))
@@ -1246,6 +1272,13 @@
       pruneProvenRenderedAssistantDuplicates(collected, applied, originals);
       collected.imageCount = collected.messages.reduce((sum, message) =>
         sum + Math.max(0, Number(message.imageCount || 0)), 0);
+    }
+    diagnostics.scanUserGroupCoveragePct = diagnostics.apiUserTurns
+      ? Math.min(100, Math.round(visitedGroupIds.size * 100 / diagnostics.apiUserTurns))
+      : 100;
+    if (diagnostics.scanStopReason === "at-scroll-limit" &&
+        visitedGroupIds.size < diagnostics.apiUserTurns) {
+      diagnostics.scanStopReason = "incomplete-group-coverage";
     }
     diagnostics.scanMatchedAssistantGroups = matchedAssistantGroups.size;
     diagnostics.scanUnmatchedAssistantGroups = Math.max(0,

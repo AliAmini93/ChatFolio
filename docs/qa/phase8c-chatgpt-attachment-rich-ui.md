@@ -266,3 +266,27 @@ long conversation; compare message numbering, embedded images, clickable
 links and rendered rich components against the known-good `deb706b`
 PDF. Never upload private conversations, URLs, filenames or PDF bodies
 to the public repository. No release or version bump.
+
+
+## 19 October 2026: scroll geometry is not conversation coverage
+
+Ubuntu `f2e55bc` passed 83 Node and 36 Chromium tests, yet its
+122-message live ChatGPT export enriched 3 of 39 raw-rich metadata flags.
+Its scan visited only 7 distinct mounted groups (against 29 API user
+turns), terminated `at-scroll-limit` after 6 steps, and printed
+`scanProgressPct=100`; matching time was only 2,097ms. Thus the 100%
+figure only measured the selected scroller's geometric range, not complete
+virtualized history coverage. Private output: 71 pages, 12 clickable
+links, 10 raster images; do not store personal content in the repo.
+
+Add `apiUserTurns`, `scanUserGroupCoveragePct`,
+`scanFrontierChanges`, and initial/final scroller ranges as numeric-only
+diagnostics. Once at a geometric scroll limit with fewer unique mounted
+groups than API user turns, allow one bounded return-to-top rescan,
+then report `incomplete-group-coverage` rather than `at-scroll-limit`
+if the deficit remains. This does **not** prove the root cause; selecting
+a wrong nested scrollport or delayed provider remount are live hypotheses.
+A non-remounting synthetic scrollport must reproduce this result without
+silently claiming complete scanning. It may still export the complete API
+text, but visual-rich parity is unverified. Do not release or merge until
+same-thread PDF visually matches the known-good baseline.
