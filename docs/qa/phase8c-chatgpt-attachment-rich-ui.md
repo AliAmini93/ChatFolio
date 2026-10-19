@@ -240,3 +240,29 @@ exact new SHA; inspect a fresh PDF and counters. If scan reaches near 100%
 but fewer rich responses are restored, investigate matching/availability
 rather than raising budgets again. Source content and private QA outputs
 must not enter the repository.
+
+
+## Phase 8D live regression, 19 October 2026: revert eager signature precomputation
+
+Ubuntu `1ae795a`: 122 API turns, 39 raw-rich indicators, 9 observed
+assistant groups, 5 matched/enriched, 4 unmatched, 36 scanned windows,
+31 steps, 21% scroll progress, `scanStopReason=time-budget`.
+Matching consumed 86,640 ms of 99,340 ms total; serialization took
+118 ms. The previous live `deb706b` build traversed all 29 groups,
+reached 100%, and enriched 14 raw-rich responses, with 13,441 ms spent
+in matching across 158 windows.
+
+The new eager `apiSignatures = apiMessages.map(...)` implementation
+re-scanned every API user attachment body once per mounted viewport even
+when no candidate needed its signature. That regression is suspected,
+not yet conclusively profiled. Restore the prior, live-validated
+fail-closed assistant-prose matcher while keeping counts-only group
+coverage diagnostics. Record `scanMaxMatchingMs` per capture to locate
+outliers. A passing synthetic CI test is not proof of performance on a
+real virtualized 122-turn conversation.
+
+Before merging PR #24, run the exact new commit locally; export the same
+long conversation; compare message numbering, embedded images, clickable
+links and rendered rich components against the known-good `deb706b`
+PDF. Never upload private conversations, URLs, filenames or PDF bodies
+to the public repository. No release or version bump.

@@ -795,30 +795,6 @@
       text: roles[index] === "assistant" ? chatGPTMountedAssistantText(node) : ""
     })).filter(item => item.text && item.node?.isConnected);
     if (!rendered.length) return;
-    // Precompute file-card signatures per viewport instead of per pair;
-    // uniqueness and anti-ambiguity conditions stay unchanged.
-    const apiSignatures = apiMessages.map(message =>
-      chatGPTAttachmentUserSignature(message));
-    const apiCounts = new Map(), domCounts = new Map();
-    for (const sig of apiSignatures) {
-      if (sig) apiCounts.set(sig, (apiCounts.get(sig) || 0) + 1);
-    }
-    liveNodes.forEach((node, index) => {
-      if (roles[index] !== "user") return;
-      const sig = chatGPTRenderedUserAttachmentSignature(node);
-      if (sig) domCounts.set(sig, (domCounts.get(sig) || 0) + 1);
-    });
-    const preceding = [];
-    let precedingUserSig = "";
-    apiMessages.forEach((message, index) => {
-      if (message?.role === "user") precedingUserSig = apiSignatures[index];
-      preceding[index] = precedingUserSig;
-    });
-    for (const item of rendered) {
-      const user = item.node.closest("[data-turn-key]")
-        ?.querySelector("[data-user-message-bubble]");
-      item.domSig = chatGPTRenderedUserAttachmentSignature(user);
-    }
     const matches = [];
     for (let apiIndex = 0; apiIndex < apiMessages.length; apiIndex++) {
       if (apiMessages[apiIndex]?.role !== "assistant" || pairs.has(apiIndex)) continue;
@@ -827,11 +803,25 @@
         // File cards can be recognized even when filenames are injected into
         // the visible bubble with extra UI labels. Missing, mismatched or
         // duplicated attachment signatures are never acceptable.
-        const apiSignature = preceding[apiIndex], domSignature = item.domSig;
+        let precedingUserIndex = apiIndex - 1;
+        while (precedingUserIndex >= 0 &&
+               apiMessages[precedingUserIndex]?.role !== "user") precedingUserIndex--;
+        const apiSignature = chatGPTAttachmentUserSignature(
+          apiMessages[precedingUserIndex]
+        );
+        const mountedUser = item.node.closest("[data-turn-key]")
+          ?.querySelector("[data-user-message-bubble]");
+        const domSignature = chatGPTRenderedUserAttachmentSignature(mountedUser);
         if (apiSignature || domSignature) {
           if (!apiSignature || apiSignature !== domSignature) continue;
-          if (apiCounts.get(apiSignature) !== 1 ||
-              domCounts.get(apiSignature) !== 1) continue;
+          const apiCount = apiMessages.filter(message =>
+            chatGPTAttachmentUserSignature(message) === apiSignature
+          ).length;
+          const domCount = liveNodes.filter((node, index) =>
+            roles[index] === "user" &&
+            chatGPTRenderedUserAttachmentSignature(node) === apiSignature
+          ).length;
+          if (apiCount !== 1 || domCount !== 1) continue;
         }
         const overlap = chatGPTAssistantContentOverlap(
           apiMessages[apiIndex].text, item.text
@@ -1041,6 +1031,7 @@
       scanMatchedAssistantGroups: 0,
       scanUnmatchedAssistantGroups: 0,
       scanMatchingMs: 0,
+      scanMaxMatchingMs: 0,
       scanElapsedMs: 0,
       scanRestored: true
     };
@@ -1071,7 +1062,9 @@
       diagnostics.scanObservedAssistantGroups = observedAssistantGroups.size;
       const matchingStarted = Date.now();
       const pairs = matchedChatGPTLiveAssistantTurns(originals, nodes);
-      diagnostics.scanMatchingMs += Date.now() - matchingStarted;
+      const matchingMs = Date.now() - matchingStarted;
+      diagnostics.scanMatchingMs += matchingMs;
+      diagnostics.scanMaxMatchingMs = Math.max(diagnostics.scanMaxMatchingMs, matchingMs);
       for (const [index, node] of pairs) {
         if (snapshots.has(index)) continue;
         const original = originals[index];
