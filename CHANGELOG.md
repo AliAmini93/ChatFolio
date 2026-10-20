@@ -1,3 +1,11 @@
+## v1.9.0 - release preparation (not yet published)
+
+- Complete planned refactoring and release infrastructure already merged in phases 1-7 and 8A/8B.
+- Integrate ChatGPT historical rendered Rich UI recovery, validated long-thread scroll coverage and bounded matching from PR #24 **only after it is reviewed and merged**.
+- Prevent silent partial Rich UI exports on background-tab changes (explicit error and retry).
+- Known issue carried forward: intermittent delayed assistant-side preview images may be rendered as loading indicators; tracked as issue #25, targeted for v1.9.1. Do not describe image-perfect parity as guaranteed.
+- Stable publication is conditional on integration CI, source/bundle integrity, real-provider manual QA or an explicit documented release-risk acceptance, final Ubuntu checkout, and maintainer approval. No release is created by this preparation branch.
+
 ## v1.8.11 - Gemini pagination and cross-provider image support (2026-10-13)
 
 - Prevent excessive blank A4 space when Gemini's first answer fragment is a long paragraph.
