@@ -319,3 +319,29 @@ developed separately. Users must keep the tab visible until completion.
 **No merge / v1.9.0 release** until real Chrome behavior and PDF parity
 are reconfirmed against the private foreground baseline. Never upload
 private conversation content into the public repository.
+
+
+## v1.9.1 draft — delayed rendered assistant images (Issue #25)
+
+Baseline stable `v1.9.0` contains a known intermittent defect: some
+ChatGPT assistant previews render as loading circles in otherwise complete
+74-page exports (11 versus 15 raster image placements). The user approved
+shipping `v1.9.0` with this defect disclosed; **do not rewrite or
+re-release the stable tag**.
+
+This narrow first fix addresses the `snapshots.has(index)` short-circuit:
+the original snapshot previously won permanently, even if two image
+previews became fully loaded a moment later within the **same, independently
+identity-matched mounted assistant**. Inspect only counts of visually sized
+image elements, loaded pixels and generic loading-state markers. If there
+is strong evidence of improved media readiness, allow at most two bounded
+re-serializations for that already matched API index. Never downgrade the
+number of `<img>` elements in the captured HTML, change the API branch or
+user uploads, or block on remote citation favicons. Diagnostics log only
+`scanImagePendingSnapshots` and `scanImageRecaptures` counts.
+
+This is not yet a complete solution for images that hydrate **after a
+virtualized group has unmounted**, or for remote images that fail independently
+in the print iframe. A synthetic delayed-image regression and another
+122-turn real-provider PDF comparison are mandatory before considering
+this release-ready. Keep the PR Draft and issue #25 open.
