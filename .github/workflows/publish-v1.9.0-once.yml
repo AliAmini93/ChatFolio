@@ -1,0 +1,102 @@
+name: Publish ChatFolio v1.9.0 (one-time, approved)
+
+on:
+  push:
+    branches:
+      - publish/v1.9.0-once
+    paths:
+      - .github/workflows/publish-v1.9.0-once.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-chatfolio-v1.9.0
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify exact source and publish approved stable
+    if: ${{ github.repository == 'AliAmini93/ChatFolio' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      APPROVED_SOURCE: 2a60f49d48ef777af56b0c95799ad935ea3f6af4
+      EXPECTED_ZIP_SHA256: dd1b55870995b36140a251d3efe8d8bc21c40ce3954ec4d357a45187db2f7f3f
+      ZIP_NAME: chatfolio-1.9.0-chrome.zip
+    steps:
+      - name: Checkout exact approved main source
+        uses: actions/checkout@v4
+        with:
+          ref: 2a60f49d48ef777af56b0c95799ad935ea3f6af4
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Verify immutable version/source and unpublished tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$APPROVED_SOURCE"
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$APPROVED_SOURCE"
+          test "$(node -p "require('./manifest.json').version")" = "1.9.0"
+          test "$(node -p "require('./package.json').version")" = "1.9.0"
+          if git ls-remote --tags origin refs/tags/v1.9.0 | grep -q .; then
+            echo "Tag already exists; refusing an additional or modified publication."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - name: Install regression dependencies and Chromium
+        run: |
+          python -m pip install -r requirements-ci.txt
+          python -m playwright install --with-deps chromium
+      - name: Validate code and generated bundle
+        run: |
+          npm run bundle:check
+          npm run check
+      - name: Re-run all unit and real-Chromium fixture tests
+        run: npm test
+      - name: Build reproducible release ZIP and enforce identical bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run build
+          python scripts/release_gate.py
+          test "$(stat -c %s "dist/$ZIP_NAME")" -eq 115230
+          printf '%s  %s\n' "$EXPECTED_ZIP_SHA256" "dist/$ZIP_NAME" | sha256sum -c -
+
+      - name: Create annotated stable tag at the verified source SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$APPROVED_SOURCE"
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$APPROVED_SOURCE"
+          if git ls-remote --tags origin refs/tags/v1.9.0 | grep -q .; then
+            echo "Tag already exists; refusing to overwrite it."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a v1.9.0 "$APPROVED_SOURCE" -m "ChatFolio v1.9.0 stable - known image preview limitation documented in issue #25"
+          git push origin refs/tags/v1.9.0
+
+      - name: Publish v1.9.0 GitHub Release with the verified ZIP and disclosures
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create v1.9.0 "dist/$ZIP_NAME" \
+            --verify-tag \
+            --title "ChatFolio v1.9.0" \
+            --notes-file RELEASE_NOTES_1.9.0.md \
+            --latest
+          test "$(gh release view v1.9.0 --json tagName --jq .tagName)" = "v1.9.0"
+          echo "Published ChatFolio v1.9.0 from $APPROVED_SOURCE; ZIP SHA256 $EXPECTED_ZIP_SHA256" >> "$GITHUB_STEP_SUMMARY"
