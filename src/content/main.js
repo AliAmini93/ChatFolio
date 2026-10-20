@@ -736,6 +736,138 @@
     return qualifying[0].index;
   }
 
+
+  function chatGPTAttachmentIdentityKeys(value) {
+    // Search extensions first. A greedy variable-length prefix retries at
+    // every character on dot-heavy logs without extensions (quadratic cost).
+    // Each possible extension examines at most 256 preceding characters.
+    const source = String(value || "");
+    const names = new Set();
+    const extensionPattern = /\.(?:pdf|txt|zip|png|jpe?g|webp|csv|docx?|xlsx?|pptx?|rtf|json|md)\b/giu;
+    for (const match of source.matchAll(extensionPattern)) {
+      const tail = source.slice(Math.max(0, match.index - 256), match.index);
+      const basename = tail.match(/[\p{L}\p{N}_.()-]{8,}$/u)?.[0];
+      if (basename) names.add((basename + match[0]).toLowerCase());
+    }
+    return [...names].sort();
+  }
+
+  function chatGPTAttachmentUserSignature(message) {
+    if (message?.role !== "user") return "";
+    const names = chatGPTAttachmentIdentityKeys(
+      String(message.text || "") + " " + String(message.html || "")
+    );
+    // Two separate file names are required, so a generic reused attachment
+    // (e.g. "report.pdf") cannot align two different conversations.
+    return names.length >= 2 ? names.join("\u001f") : "";
+  }
+
+  function chatGPTRenderedUserAttachmentSignature(node) {
+    // Card labels and file names may be concatenated in innerText without a
+    // separator (e.g. "Documentexample.pdf"). Read authored leaf text
+    // individually before falling back to the whole bubble's visible text.
+    const leafNames = [...(node?.querySelectorAll?.("*") || [])]
+      .filter(element => element.childElementCount === 0)
+      .flatMap(element => chatGPTAttachmentIdentityKeys(element.textContent));
+    const names = [...new Set(leafNames)].sort();
+    const resolved = names.length >= 2 ? names :
+      chatGPTAttachmentIdentityKeys(node?.innerText || node?.textContent || "");
+    return resolved.length >= 2 ? resolved.join("\u001f") : "";
+  }
+
+
+  function chatGPTMountedAssistantText(node) {
+    // A 2026 grouped turn holds BOTH the user bubble and assistant. Do not
+    // score prose echoed by the user as evidence of an assistant match.
+    const group = node?.closest?.("[data-turn-key]");
+    if (!group || !group.querySelector?.("[data-user-message-bubble]")) return "";
+    const cloned = group.cloneNode(true);
+    cloned.querySelectorAll(
+      '[data-user-message-bubble], [data-conversation-role="user"],' +
+      ' [data-message-author-role="user"]'
+    ).forEach(element => element.remove());
+    return cloned.innerText || cloned.textContent || "";
+  }
+
+  function matchChatGPTByUniqueAssistantProse(apiMessages, liveNodes, roles, pairs) {
+    // Last-resort recovery when pasted terminal logs, rich user surfaces or
+    // truncated cards prevent exact user-text matching. Identity comes from
+    // three DISTINCT substantial authored prose anchors, unique across ALL
+    // candidate API assistants AND ALL mounted assistant groups. Never use
+    // a single heading, position, a generic success label, or shared code.
+    const rendered = liveNodes.map((node, index) => ({
+      node, index,
+      text: roles[index] === "assistant" ? chatGPTMountedAssistantText(node) : ""
+    })).filter(item => item.text && item.node?.isConnected);
+    if (!rendered.length) return;
+    // File-card identity is checked lazily and memoized per mounted viewport.
+    // Never precompute every long API message before a candidate needs it.
+    const apiUserKeys = new Map();
+    const domUserKeys = new WeakMap();
+    const apiSignature = index => {
+      if (!apiUserKeys.has(index)) {
+        apiUserKeys.set(index, chatGPTAttachmentUserSignature(apiMessages[index]));
+      }
+      return apiUserKeys.get(index);
+    };
+    const domSignature = node => {
+      if (!node) return "";
+      if (!domUserKeys.has(node)) {
+        domUserKeys.set(node, chatGPTRenderedUserAttachmentSignature(node));
+      }
+      return domUserKeys.get(node);
+    };
+    const apiCounts = new Map(), domCounts = new Map();
+    const countApi = key => {
+      if (!apiCounts.has(key)) {
+        apiCounts.set(key, apiMessages.filter((_, index) => apiSignature(index) === key).length);
+      }
+      return apiCounts.get(key);
+    };
+    const countDom = key => {
+      if (!domCounts.has(key)) {
+        domCounts.set(key, liveNodes.filter((node, index) =>
+          roles[index] === "user" && domSignature(node) === key).length);
+      }
+      return domCounts.get(key);
+    };
+    const matches = [];
+    for (let apiIndex = 0; apiIndex < apiMessages.length; apiIndex++) {
+      if (apiMessages[apiIndex]?.role !== "assistant" || pairs.has(apiIndex)) continue;
+      for (const item of rendered) {
+        // A prose-only identity MUST NOT bypass stricter attachment identity.
+        // File cards can be recognized even when filenames are injected into
+        // the visible bubble with extra UI labels. Missing, mismatched or
+        // duplicated attachment signatures are never acceptable.
+        let precedingUserIndex = apiIndex - 1;
+        while (precedingUserIndex >= 0 &&
+               apiMessages[precedingUserIndex]?.role !== "user") precedingUserIndex--;
+        const apiKey = apiSignature(precedingUserIndex);
+        const mountedUser = item.node.closest("[data-turn-key]")
+          ?.querySelector("[data-user-message-bubble]");
+        const domKey = domSignature(mountedUser);
+        if (apiKey || domKey) {
+          if (!apiKey || apiKey !== domKey) continue;
+          if (countApi(apiKey) !== 1 || countDom(apiKey) !== 1) continue;
+        }
+        const overlap = chatGPTAssistantContentOverlap(
+          apiMessages[apiIndex].text, item.text
+        );
+        if (overlap.total < 3 || overlap.hits < 3 ||
+            overlap.hits < Math.ceil(overlap.total * 0.75)) continue;
+        matches.push({ apiIndex, domIndex: item.index, node: item.node });
+      }
+    }
+    // Mutual uniqueness is mandatory: two metadata segments resembling one
+    // authored response, or two identical mounted replies, both fail closed.
+    for (const candidate of matches) {
+      if (matches.filter(item => item.apiIndex === candidate.apiIndex).length !== 1 ||
+          matches.filter(item => item.domIndex === candidate.domIndex).length !== 1 ||
+          [...pairs.values()].includes(candidate.node)) continue;
+      pairs.set(candidate.apiIndex, candidate.node);
+    }
+  }
+
   function matchedChatGPTLiveAssistantTurns(apiMessages, liveNodes) {
     const pairs = new Map();
     if (!apiMessages?.length || !liveNodes?.length) return pairs;
@@ -791,6 +923,48 @@
       const matched = findMatchedAssistantInRun(apiMessages, apiIndex + 1, liveNodes[domIndex + 1]);
       if (matched >= 0) pairs.set(matched, liveNodes[domIndex + 1]);
     }
+    // Attachment-only/attachment-heavy user requests may render as several
+    // file cards with UI labels; their visible text is not exactly the same
+    // string as metadata text. Accept only a UNIQUE two-file signature in
+    // BOTH sources, a single grouped user/assistant exchange, and two
+    // substantial matching prose anchors from the actual assistant content.
+    // No positional guess or common single filename can authorize an overlay.
+    const apiAttachmentUsers = new Map(), domAttachmentUsers = new Map();
+    apiMessages.forEach((message, index) => {
+      const signature = chatGPTAttachmentUserSignature(message);
+      if (signature) {
+        if (!apiAttachmentUsers.has(signature)) apiAttachmentUsers.set(signature, []);
+        apiAttachmentUsers.get(signature).push(index);
+      }
+    });
+    liveNodes.forEach((node, index) => {
+      if (roles[index] !== "user") return;
+      const signature = chatGPTRenderedUserAttachmentSignature(node);
+      if (signature) {
+        if (!domAttachmentUsers.has(signature)) domAttachmentUsers.set(signature, []);
+        domAttachmentUsers.get(signature).push(index);
+      }
+    });
+    for (const [signature, indexes] of apiAttachmentUsers) {
+      const liveIndexes = domAttachmentUsers.get(signature) || [];
+      if (indexes.length !== 1 || liveIndexes.length !== 1) continue;
+      const apiIndex = indexes[0], domIndex = liveIndexes[0];
+      if (apiMessages[apiIndex + 1]?.role !== "assistant" ||
+          roles[domIndex + 1] !== "assistant") continue;
+      const userGroup = liveNodes[domIndex].closest?.("[data-turn-key]");
+      const assistantGroup = liveNodes[domIndex + 1].closest?.("[data-turn-key]");
+      if (!userGroup || assistantGroup !== userGroup) continue;
+      const matched = findMatchedAssistantInRun(apiMessages, apiIndex + 1, liveNodes[domIndex + 1]);
+      if (matched < 0 || pairs.has(matched)) continue;
+      const content = ADAPTER.findTurn(liveNodes[domIndex + 1]) || liveNodes[domIndex + 1];
+      const overlap = chatGPTAssistantContentOverlap(
+        apiMessages[matched]?.text, content.innerText || content.textContent || ""
+      );
+      if (overlap.total < 2 || overlap.hits < 2 ||
+          overlap.hits < Math.ceil(overlap.total * 0.6)) continue;
+      pairs.set(matched, liveNodes[domIndex + 1]);
+    }
+    matchChatGPTByUniqueAssistantProse(apiMessages, liveNodes, roles, pairs);
     return pairs;
   }
 
@@ -840,60 +1014,341 @@
   async function enhanceChatGPTMetadataWithRenderedDom(collected, options, session) {
     if (PLATFORM.id !== "chatgpt" || collected?.extractionSource !== "metadata" ||
         !Array.isArray(collected.messages) || !collected.messages.length) return collected;
-    const liveNodes = getMessageNodes().filter(node =>
+
+    // Keep immutable API metadata as the identity/order authority throughout
+    // the scan. Detached snapshots must be serialized BEFORE virtualized DOM
+    // nodes are removed, then applied at their original API indexes.
+    const originals = [...collected.messages];
+    const rawRich = message => /<(?:grid|box|row|CodeBlock|Link|Chart|carousel|card)(?:\s|>)/i
+      .test(String(message?.text || ""));
+    const snapshots = new Map();
+    const visitedGroupIds = new Set();
+    let previousFirstGroupKey = "";
+    const observedAssistantGroups = new Set();
+    const matchedAssistantGroups = new Set();
+    const initialNodes = getMessageNodes().filter(node =>
       ADAPTER.getRole(node) === "user" || ADAPTER.getRole(node) === "assistant"
     );
-    const pairs = matchedChatGPTLiveAssistantTurns(collected.messages, liveNodes);
-    if (!pairs.size) return collected;
-    const originalMessages = [...collected.messages];
-    let replacements = 0;
-    for (const [index, node] of pairs) {
+    const diagnostics = {
+      apiTurns: originals.length,
+      apiUserTurns: originals.filter(message => message.role === "user").length,
+      apiAssistants: originals.filter(message => message.role === "assistant").length,
+      apiRawRich: originals.filter(message => message.role === "assistant" && rawRich(message)).length,
+      mountedTurns: initialNodes.length,
+      mountedAssistants: initialNodes.filter(node => ADAPTER.getRole(node) === "assistant").length,
+      matchedAssistants: 0,
+      matchedRawRich: 0,
+      enrichedAssistants: 0,
+      enrichedRawRich: 0,
+      skippedApiMedia: 0,
+      skippedDisconnected: 0,
+      skippedShortLiveText: 0,
+      failedCapture: 0,
+      scanWindows: 0,
+      scanSteps: 0,
+      scanTopWaitRounds: 0,
+      scanDistinctGroups: 0,
+      scanUserGroupCoveragePct: 0,
+      scanCoverageRetries: 0,
+      scanFrontierChanges: 0,
+      scanScrollerRangeStart: null,
+      scanScrollerRangeEnd: null,
+      scanProgressPct: null,
+      scanMaxMountedTurns: initialNodes.length,
+      scanStopReason: "not-needed",
+      scanTabBackgrounded: false,
+      scanCaptureMs: 0,
+      scanMaxCaptureMs: 0,
+      scanSerializeMs: 0,
+      scanMaxSerializeMs: 0,
+      scanSerializeAttempts: 0,
+      scanObservedAssistantGroups: 0,
+      scanMatchedAssistantGroups: 0,
+      scanUnmatchedAssistantGroups: 0,
+      scanMatchingMs: 0,
+      scanMaxMatchingMs: 0,
+      scanElapsedMs: 0,
+      scanRestored: true
+    };
+    const report = () => console.info(
+      "ChatFolio Rich UI QA (counts only):", JSON.stringify(diagnostics)
+    );
+
+    const scanStarted = Date.now();
+    let backgrounded = document.visibilityState === "hidden";
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") backgrounded = true;
+    };
+    const requireForeground = () => {
+      if (!backgrounded && document.visibilityState !== "hidden") return;
+      diagnostics.scanTabBackgrounded = true;
+      diagnostics.scanStopReason = "tab-backgrounded";
+      const error = new Error(
+        "ChatFolio: ChatGPT was moved to a background tab during Rich UI extraction. " +
+        "Keep the ChatGPT tab visible until export completes, then retry. " +
+        "No incomplete PDF was generated."
+      );
+      error.code = "CHATFOLIO_TAB_HIDDEN";
+      throw error;
+    };
+    const captureWindow = async () => {
+      const captureStarted = Date.now();
+      requireForeground();
       throwIfCancelled(session);
       assertSameConversation(session);
-      const original = collected.messages[index];
-      // An API-sourced image may have authentication/metadata unavailable to
-      // the live DOM. Never throw it away as part of a visual enhancement.
-      if (original.role !== "assistant" || Number(original.imageCount || 0) > 0 ||
-          !node.isConnected) continue;
+      const nodes = getMessageNodes().filter(node =>
+        ADAPTER.getRole(node) === "user" || ADAPTER.getRole(node) === "assistant"
+      );
+      diagnostics.scanWindows++;
+      diagnostics.scanMaxMountedTurns = Math.max(diagnostics.scanMaxMountedTurns, nodes.length);
+      for (const node of nodes) {
+        const key = node.closest?.("[data-turn-key]")?.getAttribute?.("data-turn-key");
+        if (key) visitedGroupIds.add(key);
+      }
+      diagnostics.scanDistinctGroups = visitedGroupIds.size;
+      const firstKey = nodes[0]?.closest?.("[data-turn-key]")?.getAttribute?.("data-turn-key") || "";
+      if (firstKey && previousFirstGroupKey && firstKey !== previousFirstGroupKey) {
+        diagnostics.scanFrontierChanges++;
+      }
+      if (firstKey) previousFirstGroupKey = firstKey;
+      for (const node of nodes) {
+        if (ADAPTER.getRole(node) !== "assistant") continue;
+        const key = node.closest?.("[data-turn-key]")?.getAttribute?.("data-turn-key");
+        if (key) observedAssistantGroups.add(key);
+      }
+      diagnostics.scanObservedAssistantGroups = observedAssistantGroups.size;
+      const matchingStarted = Date.now();
+      const pairs = matchedChatGPTLiveAssistantTurns(originals, nodes);
+      requireForeground();
+      const matchingMs = Date.now() - matchingStarted;
+      diagnostics.scanMatchingMs += matchingMs;
+      diagnostics.scanMaxMatchingMs = Math.max(diagnostics.scanMaxMatchingMs, matchingMs);
+      for (const [index, node] of pairs) {
+        if (snapshots.has(index)) continue;
+        const original = originals[index];
+        if (original?.role !== "assistant") continue;
+        // Do not replace authenticated API-only media with a partial
+        // screenshot of a temporarily mounted provider page.
+        if (Number(original.imageCount || 0) > 0) {
+          diagnostics.skippedApiMedia++;
+          continue;
+        }
+        if (!node.isConnected) {
+          diagnostics.skippedDisconnected++;
+          continue;
+        }
+        const serializeStarted = Date.now();
+        diagnostics.scanSerializeAttempts++;
+        try {
+          const rendered = await serializeTurn(
+            ADAPTER.findTurn(node), node, "assistant",
+            options.embedImages !== false, session.controller.signal
+          );
+          throwIfCancelled(session);
+          requireForeground();
+          assertSameConversation(session);
+          const visible = comparableChatGPTTurnText(rendered.text);
+          const source = comparableChatGPTTurnText(original.text);
+          if (!visible || (source.length > 240 &&
+              visible.length < Math.min(60, source.length * 0.1))) {
+            diagnostics.skippedShortLiveText++;
+            continue;
+          }
+          snapshots.set(index, rendered);
+          const key = node.closest?.("[data-turn-key]")?.getAttribute?.("data-turn-key");
+          if (key) matchedAssistantGroups.add(key);
+        } catch (error) {
+          if (isCancelledError(error) || error?.code === "CHATFOLIO_TAB_HIDDEN") throw error;
+          diagnostics.failedCapture++;
+          // Report counts, not user content, signed URLs or exception text.
+        } finally {
+          const elapsed = Date.now() - serializeStarted;
+          diagnostics.scanSerializeMs += elapsed;
+          diagnostics.scanMaxSerializeMs = Math.max(diagnostics.scanMaxSerializeMs, elapsed);
+        }
+      }
+      requireForeground();
+      const captured = Date.now() - captureStarted;
+      diagnostics.scanCaptureMs += captured;
+      diagnostics.scanMaxCaptureMs = Math.max(diagnostics.scanMaxCaptureMs, captured);
+    };
+
+    // The latest viewport remains useful even if no movable scrollport can be
+    // found. Browsers that virtualize the thread may mount only 4 of 86
+    // assistant nodes; scan their scrollport in bounded incremental windows.
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    try {
+    await captureWindow();
+    if (diagnostics.apiRawRich && initialNodes.length < originals.length &&
+        snapshots.size < diagnostics.apiRawRich && initialNodes.length >= 2) {
+      let scroller = null;
       try {
-        const turn = ADAPTER.findTurn(node);
-        const rendered = await serializeTurn(
-          turn, node, "assistant", options.embedImages !== false, session.controller.signal
+        scroller = await resolveConversationScrollContainer(
+          initialNodes[0], "chatgpt", session.controller.signal
         );
-        throwIfCancelled(session);
-        assertSameConversation(session);
-        const visible = comparableChatGPTTurnText(rendered.text);
-        const source = comparableChatGPTTurnText(original.text);
-        // A substantially truncated live reply must not replace the complete
-        // API response. Markup source can be longer than displayed text.
-        if (!visible || (source.length > 240 && visible.length < Math.min(60, source.length * 0.1))) continue;
-        collected.messages[index] = {
-          ...original,
-          html: rendered.html,
-          text: rendered.text,
-          imageCount: Math.max(0, Number(rendered.imageCount || 0))
-        };
-        replacements += 1;
       } catch (error) {
         if (isCancelledError(error)) throw error;
-        // A rich snapshot is an optional fidelity enhancement, never a
-        // reason to discard the already complete ordered metadata response.
-        console.info("ChatFolio: retaining full ChatGPT metadata response; rich DOM capture unavailable.",
-          error?.message || String(error));
+      }
+      diagnostics.scanStopReason = scroller ? "short-scrollport" : "no-scrollport";
+      if (scroller && scrollRange(scroller) > 24) {
+        diagnostics.scanStopReason = "step-budget";
+        diagnostics.scanScrollerRangeStart = Math.round(scrollRange(scroller));
+        const originalTop = getScrollTop(scroller);
+        const prior = {
+          behavior: scroller.style.getPropertyValue("scroll-behavior"),
+          behaviorPriority: scroller.style.getPropertyPriority("scroll-behavior"),
+          anchor: scroller.style.getPropertyValue("overflow-anchor"),
+          anchorPriority: scroller.style.getPropertyPriority("overflow-anchor"),
+          snap: scroller.style.getPropertyValue("scroll-snap-type"),
+          snapPriority: scroller.style.getPropertyPriority("scroll-snap-type")
+        };
+        const started = Date.now();
+        const restore = (property, value, priority) => {
+          if (value) scroller.style.setProperty(property, value, priority);
+          else scroller.style.removeProperty(property);
+        };
+        try {
+          scroller.style.setProperty("scroll-behavior", "auto", "important");
+          scroller.style.setProperty("overflow-anchor", "none", "important");
+          scroller.style.setProperty("scroll-snap-type", "none", "important");
+          setScrollTop(scroller, 0);
+          await sleepWithAbort(240, session.controller.signal);
+          // Real ChatGPT can prepend earlier virtual groups asynchronously
+          // after reaching the top. A brief fixed 600ms wait misses those
+          // groups. Require five unchanged *top frontiers* (max 3.6s) while
+          // repeatedly capturing newly mounted responses.
+          let topFrontier = "";
+          let stableTop = 0;
+          for (let round = 0; round < 12 && Date.now() - started < 7000; round++) {
+            throwIfCancelled(session);
+            assertSameConversation(session);
+            await captureWindow();
+            diagnostics.scanTopWaitRounds++;
+            const first = getMessageNodes()[0];
+            const key = first?.closest?.("[data-turn-key]")?.getAttribute?.("data-turn-key") || "";
+            const frontier = key || String(first?.textContent || "").slice(0, 96);
+            if (frontier && frontier === topFrontier) stableTop++;
+            else stableTop = 0;
+            topFrontier = frontier;
+            if (stableTop >= 5) break;
+            setScrollTop(scroller, 0);
+            await sleepWithAbort(300, session.controller.signal);
+          }
+          let stuck = 0;
+          for (let step = 0; step < 180 && Date.now() - started < 90000; step++) {
+            throwIfCancelled(session);
+            assertSameConversation(session);
+            await captureWindow();
+            diagnostics.scanSteps++;
+            const top = getScrollTop(scroller);
+            const range = scrollRange(scroller);
+            const viewport = getClientHeight(scroller);
+            if (range <= 24) {
+              diagnostics.scanStopReason = "short-scrollport";
+              break;
+            }
+            const target = Math.min(range, top + Math.max(160, viewport * 0.42));
+            if (target <= top + 3) {
+              stuck++;
+              if (stuck >= 3) {
+                // A scrollport ending is not proof that the virtualized chat
+                // mounted every user exchange. Retry its start once to allow
+                // late hydration; report incomplete coverage if still short.
+                if (diagnostics.scanCoverageRetries < 1 &&
+                    visitedGroupIds.size < diagnostics.apiUserTurns) {
+                  diagnostics.scanCoverageRetries++;
+                  stuck = 0;
+                  setScrollTop(scroller, 0);
+                  await sleepWithAbort(750, session.controller.signal);
+                  await captureWindow();
+                  continue;
+                }
+                diagnostics.scanStopReason = "at-scroll-limit";
+                break;
+              }
+              await sleepWithAbort(260, session.controller.signal);
+              continue;
+            }
+            setScrollTop(scroller, target);
+            await sleepWithAbort(230, session.controller.signal);
+            const moved = getScrollTop(scroller);
+            if (Math.abs(moved - top) <= 3) stuck++;
+            else stuck = 0;
+            if (stuck >= 4) {
+              diagnostics.scanStopReason = "scroll-stalled";
+              break;
+            }
+          }
+          if (Date.now() - started >= 90000) diagnostics.scanStopReason = "time-budget";
+          await captureWindow();
+          const finalRange = scrollRange(scroller);
+          diagnostics.scanScrollerRangeEnd = Math.round(finalRange);
+          diagnostics.scanProgressPct = finalRange > 0
+            ? Math.max(0, Math.min(100,
+                Math.round(getScrollTop(scroller) * 100 / finalRange)))
+            : 100;
+        } finally {
+          // Always put the user's scroll position and inline styling back,
+          // including Stop, provider navigation or a failed media snapshot.
+          try {
+            setScrollTop(scroller, originalTop);
+            restore("scroll-behavior", prior.behavior, prior.behaviorPriority);
+            restore("overflow-anchor", prior.anchor, prior.anchorPriority);
+            restore("scroll-snap-type", prior.snap, prior.snapPriority);
+          } catch {
+            diagnostics.scanRestored = false;
+          }
+        }
       }
     }
-    if (replacements) {
-      pruneProvenRenderedAssistantDuplicates(collected, pairs, originalMessages);
+
+    requireForeground();
+    } catch (error) {
+      if (error?.code === "CHATFOLIO_TAB_HIDDEN") {
+        diagnostics.scanElapsedMs = Date.now() - scanStarted;
+        report();
+      }
+      throw error;
+    } finally {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    }
+
+    const applied = new Map();
+    for (const [index, rendered] of snapshots) {
+      collected.messages[index] = {
+        ...originals[index],
+        html: rendered.html,
+        text: rendered.text,
+        imageCount: Math.max(0, Number(rendered.imageCount || 0))
+      };
+      applied.set(index, true);
+    }
+    diagnostics.matchedAssistants = applied.size;
+    diagnostics.matchedRawRich = [...applied.keys()].filter(index => rawRich(originals[index])).length;
+    diagnostics.enrichedAssistants = applied.size;
+    diagnostics.enrichedRawRich = diagnostics.matchedRawRich;
+    if (applied.size) {
+      // Prune only previously corroborated raw Rich UI duplicates, after all
+      // snapshot indexes have been resolved against the original API array.
+      pruneProvenRenderedAssistantDuplicates(collected, applied, originals);
       collected.imageCount = collected.messages.reduce((sum, message) =>
         sum + Math.max(0, Number(message.imageCount || 0)), 0);
-      console.info("ChatFolio: enriched safely matched ChatGPT turns with rendered-page content:", replacements);
     }
+    diagnostics.scanUserGroupCoveragePct = diagnostics.apiUserTurns
+      ? Math.min(100, Math.round(visitedGroupIds.size * 100 / diagnostics.apiUserTurns))
+      : 100;
+    if (diagnostics.scanStopReason === "at-scroll-limit" &&
+        visitedGroupIds.size < diagnostics.apiUserTurns) {
+      diagnostics.scanStopReason = "incomplete-group-coverage";
+    }
+    diagnostics.scanMatchedAssistantGroups = matchedAssistantGroups.size;
+    diagnostics.scanUnmatchedAssistantGroups = Math.max(0,
+      observedAssistantGroups.size - matchedAssistantGroups.size);
+    diagnostics.scanElapsedMs = Date.now() - scanStarted;
+    report();
     return collected;
   }
 
-  // ChatGPT can have tall wrappers (scrollHeight > clientHeight) that are NOT
-  // scrollports. A candidate is usable only when its scroll actually moves the
-  // authored conversation. Never fall back to the largest scrollHeight alone.
   function collectScrollCandidates(messageNode, platformId = PLATFORM.id) {
     const list = [];
     const add = (node) => {
