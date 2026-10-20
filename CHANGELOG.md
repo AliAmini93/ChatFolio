@@ -1,10 +1,11 @@
-## v1.9.0 - release preparation (not yet published)
+## v1.9.0 - Stabilized refactoring release (2026-10-20)
 
-- Complete planned refactoring and release infrastructure already merged in phases 1-7 and 8A/8B.
-- Integrate ChatGPT historical rendered Rich UI recovery, validated long-thread scroll coverage and bounded matching from PR #24 **only after it is reviewed and merged**.
-- Prevent silent partial Rich UI exports on background-tab changes (explicit error and retry).
-- Known issue carried forward: intermittent delayed assistant-side preview images may be rendered as loading indicators; tracked as issue #25, targeted for v1.9.1. Do not describe image-perfect parity as guaranteed.
-- Stable publication is conditional on integration CI, source/bundle integrity, real-provider manual QA or an explicit documented release-risk acceptance, final Ubuntu checkout, and maintainer approval. No release is created by this preparation branch.
+- Integrate modular provider architecture, stronger media and print security, long-conversation recovery, deterministic build verification and Release Gate.
+- Preserve historical ChatGPT Rich UI from virtualized conversations using bounded identity matching; protect against silent partial export when ChatGPT is backgrounded.
+- Benchmarked on a 122-turn ChatGPT conversation: 29/29 groups visited, 14 rendered-rich matches, 74 PDF pages and 57 live links; matching improved from 13.3s to 2.4s in observed real runs.
+- **Known issue #25:** intermittent delayed assistant image previews can appear as loading placeholders (11 vs 15 raster image appearances). Target for v1.9.1.
+- **Explicit release exception:** 22 live-provider QA scenarios have not all been manually passed; maintainer accepted disclosure and release risk on 2026-10-20. Do not fabricate PASS results.
+- No user conversation content included in repository or distributable.
 
 ## v1.8.11 - Gemini pagination and cross-provider image support (2026-10-13)
 
