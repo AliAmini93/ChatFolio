@@ -1749,13 +1749,18 @@
 
 
   function chatGPTAttachmentIdentityKeys(value) {
-    // Only compare recognizable FILE names from user-owned content. The
-    // basename-tail avoids unrelated provider UI labels such as "Document"
-    // and "PDF", and deliberately ignores short generic filenames.
-    const names = String(value || "").match(
-      /[\p{L}\p{N}_.()-]{8,}\.(?:pdf|txt|zip|png|jpe?g|webp|csv|docx?|xlsx?|pptx?|rtf|json|md)\b/giu
-    ) || [];
-    return [...new Set(names.map(name => name.toLowerCase()))].sort();
+    // Search extensions first. A greedy variable-length prefix retries at
+    // every character on dot-heavy logs without extensions (quadratic cost).
+    // Each possible extension examines at most 256 preceding characters.
+    const source = String(value || "");
+    const names = new Set();
+    const extensionPattern = /\.(?:pdf|txt|zip|png|jpe?g|webp|csv|docx?|xlsx?|pptx?|rtf|json|md)\b/giu;
+    for (const match of source.matchAll(extensionPattern)) {
+      const tail = source.slice(Math.max(0, match.index - 256), match.index);
+      const basename = tail.match(/[\p{L}\p{N}_.()-]{8,}$/u)?.[0];
+      if (basename) names.add((basename + match[0]).toLowerCase());
+    }
+    return [...names].sort();
   }
 
   function chatGPTAttachmentUserSignature(message) {
@@ -1806,6 +1811,37 @@
       text: roles[index] === "assistant" ? chatGPTMountedAssistantText(node) : ""
     })).filter(item => item.text && item.node?.isConnected);
     if (!rendered.length) return;
+    // File-card identity is checked lazily and memoized per mounted viewport.
+    // Never precompute every long API message before a candidate needs it.
+    const apiUserKeys = new Map();
+    const domUserKeys = new WeakMap();
+    const apiSignature = index => {
+      if (!apiUserKeys.has(index)) {
+        apiUserKeys.set(index, chatGPTAttachmentUserSignature(apiMessages[index]));
+      }
+      return apiUserKeys.get(index);
+    };
+    const domSignature = node => {
+      if (!node) return "";
+      if (!domUserKeys.has(node)) {
+        domUserKeys.set(node, chatGPTRenderedUserAttachmentSignature(node));
+      }
+      return domUserKeys.get(node);
+    };
+    const apiCounts = new Map(), domCounts = new Map();
+    const countApi = key => {
+      if (!apiCounts.has(key)) {
+        apiCounts.set(key, apiMessages.filter((_, index) => apiSignature(index) === key).length);
+      }
+      return apiCounts.get(key);
+    };
+    const countDom = key => {
+      if (!domCounts.has(key)) {
+        domCounts.set(key, liveNodes.filter((node, index) =>
+          roles[index] === "user" && domSignature(node) === key).length);
+      }
+      return domCounts.get(key);
+    };
     const matches = [];
     for (let apiIndex = 0; apiIndex < apiMessages.length; apiIndex++) {
       if (apiMessages[apiIndex]?.role !== "assistant" || pairs.has(apiIndex)) continue;
@@ -1817,22 +1853,13 @@
         let precedingUserIndex = apiIndex - 1;
         while (precedingUserIndex >= 0 &&
                apiMessages[precedingUserIndex]?.role !== "user") precedingUserIndex--;
-        const apiSignature = chatGPTAttachmentUserSignature(
-          apiMessages[precedingUserIndex]
-        );
+        const apiKey = apiSignature(precedingUserIndex);
         const mountedUser = item.node.closest("[data-turn-key]")
           ?.querySelector("[data-user-message-bubble]");
-        const domSignature = chatGPTRenderedUserAttachmentSignature(mountedUser);
-        if (apiSignature || domSignature) {
-          if (!apiSignature || apiSignature !== domSignature) continue;
-          const apiCount = apiMessages.filter(message =>
-            chatGPTAttachmentUserSignature(message) === apiSignature
-          ).length;
-          const domCount = liveNodes.filter((node, index) =>
-            roles[index] === "user" &&
-            chatGPTRenderedUserAttachmentSignature(node) === apiSignature
-          ).length;
-          if (apiCount !== 1 || domCount !== 1) continue;
+        const domKey = domSignature(mountedUser);
+        if (apiKey || domKey) {
+          if (!apiKey || apiKey !== domKey) continue;
+          if (countApi(apiKey) !== 1 || countDom(apiKey) !== 1) continue;
         }
         const overlap = chatGPTAssistantContentOverlap(
           apiMessages[apiIndex].text, item.text
@@ -2040,6 +2067,7 @@
       scanProgressPct: null,
       scanMaxMountedTurns: initialNodes.length,
       scanStopReason: "not-needed",
+      scanTabBackgrounded: false,
       scanCaptureMs: 0,
       scanMaxCaptureMs: 0,
       scanSerializeMs: 0,
@@ -2058,8 +2086,25 @@
     );
 
     const scanStarted = Date.now();
+    let backgrounded = document.visibilityState === "hidden";
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") backgrounded = true;
+    };
+    const requireForeground = () => {
+      if (!backgrounded && document.visibilityState !== "hidden") return;
+      diagnostics.scanTabBackgrounded = true;
+      diagnostics.scanStopReason = "tab-backgrounded";
+      const error = new Error(
+        "ChatFolio: ChatGPT was moved to a background tab during Rich UI extraction. " +
+        "Keep the ChatGPT tab visible until export completes, then retry. " +
+        "No incomplete PDF was generated."
+      );
+      error.code = "CHATFOLIO_TAB_HIDDEN";
+      throw error;
+    };
     const captureWindow = async () => {
       const captureStarted = Date.now();
+      requireForeground();
       throwIfCancelled(session);
       assertSameConversation(session);
       const nodes = getMessageNodes().filter(node =>
@@ -2085,6 +2130,7 @@
       diagnostics.scanObservedAssistantGroups = observedAssistantGroups.size;
       const matchingStarted = Date.now();
       const pairs = matchedChatGPTLiveAssistantTurns(originals, nodes);
+      requireForeground();
       const matchingMs = Date.now() - matchingStarted;
       diagnostics.scanMatchingMs += matchingMs;
       diagnostics.scanMaxMatchingMs = Math.max(diagnostics.scanMaxMatchingMs, matchingMs);
@@ -2110,6 +2156,7 @@
             options.embedImages !== false, session.controller.signal
           );
           throwIfCancelled(session);
+          requireForeground();
           assertSameConversation(session);
           const visible = comparableChatGPTTurnText(rendered.text);
           const source = comparableChatGPTTurnText(original.text);
@@ -2122,7 +2169,7 @@
           const key = node.closest?.("[data-turn-key]")?.getAttribute?.("data-turn-key");
           if (key) matchedAssistantGroups.add(key);
         } catch (error) {
-          if (isCancelledError(error)) throw error;
+          if (isCancelledError(error) || error?.code === "CHATFOLIO_TAB_HIDDEN") throw error;
           diagnostics.failedCapture++;
           // Report counts, not user content, signed URLs or exception text.
         } finally {
@@ -2131,6 +2178,7 @@
           diagnostics.scanMaxSerializeMs = Math.max(diagnostics.scanMaxSerializeMs, elapsed);
         }
       }
+      requireForeground();
       const captured = Date.now() - captureStarted;
       diagnostics.scanCaptureMs += captured;
       diagnostics.scanMaxCaptureMs = Math.max(diagnostics.scanMaxCaptureMs, captured);
@@ -2139,6 +2187,8 @@
     // The latest viewport remains useful even if no movable scrollport can be
     // found. Browsers that virtualize the thread may mount only 4 of 86
     // assistant nodes; scan their scrollport in bounded incremental windows.
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    try {
     await captureWindow();
     if (diagnostics.apiRawRich && initialNodes.length < originals.length &&
         snapshots.size < diagnostics.apiRawRich && initialNodes.length >= 2) {
@@ -2261,6 +2311,17 @@
           }
         }
       }
+    }
+
+    requireForeground();
+    } catch (error) {
+      if (error?.code === "CHATFOLIO_TAB_HIDDEN") {
+        diagnostics.scanElapsedMs = Date.now() - scanStarted;
+        report();
+      }
+      throw error;
+    } finally {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     }
 
     const applied = new Map();

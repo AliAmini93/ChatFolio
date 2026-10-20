@@ -290,3 +290,32 @@ A non-remounting synthetic scrollport must reproduce this result without
 silently claiming complete scanning. It may still export the complete API
 text, but visual-rich parity is unverified. Do not release or merge until
 same-thread PDF visually matches the known-good baseline.
+
+ 
+## Phase 8D: active-tab capture invariant and bounded filename matcher
+
+Real-provider controlled A/B with the same private 122-message thread on
+`7545d98`: keeping ChatGPT foreground gave 29/29 mounted group coverage,
+14 rich snapshots, 54.6s, and a 74-page PDF with 57 clickable links and
+15 raster image appearances. A prior background-tab export saw only
+7/29 groups, took 202s and produced a deficient 71-page PDF (12 links,
+8 images). This supports background throttling/hydration as a contributor,
+not proof that every timing outlier has the same cause.
+
+The fallback filename matcher previously used a greedy variable-length
+regex that rescanned large dot-heavy logs at quadratic cost. Replace it
+with a bounded extension-first scan and lazily cached signatures in a
+single DOM matching window; retain two-file identity and unique API/DOM
+guards without guessing by position.
+
+When the ChatGPT tab becomes hidden during the rendered-DOM phase, mark
+`scanTabBackgrounded=true`, stop with `scanStopReason=tab-backgrounded`
+and a clear retry error instead of silently handing the user an incomplete
+PDF. Preserve cancellation and scroll/style restoration. This first
+fail-closed protection intentionally does not auto-resume a stale virtual
+DOM scan when switching back. A future safe resumable workflow may be
+developed separately. Users must keep the tab visible until completion.
+
+**No merge / v1.9.0 release** until real Chrome behavior and PDF parity
+are reconfirmed against the private foreground baseline. Never upload
+private conversation content into the public repository.
