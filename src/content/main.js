@@ -1199,7 +1199,7 @@
           if (hasSnapshot) {
             // Keep a previously valid rich snapshot if a new image or
             // provider cleanup path would drop previously captured images.
-            const imageTags = html => (String(html || "").match(/<img\\b/gi) || []).length;
+            const imageTags = html => (String(html || "").match(/<img\b/gi) || []).length;
             if (imageTags(rendered.html) < imageTags(snapshots.get(index)?.html)) continue;
             diagnostics.scanImageRecaptures++;
             imageUpgradeCounts.set(index, (imageUpgradeCounts.get(index) || 0) + 1);
