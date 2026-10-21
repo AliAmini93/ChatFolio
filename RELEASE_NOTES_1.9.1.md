@@ -1,6 +1,6 @@
-# ChatFolio v1.9.1 — release preparation (DRAFT)
+# ChatFolio v1.9.1 — Stable Release Notes (2026-10-21)
 
-This is a proposed narrowly scoped patch over the published ChatFolio v1.9.0 stable release. **This document and the PR are drafts; no v1.9.1 tag or public GitHub Release has been approved or created.**
+This is a narrowly scoped stable patch over ChatFolio v1.9.0. The maintainer approved its publication on **2026-10-21**, expressly accepting the outstanding cross-provider manual QA and unhandled image-hydration edge cases described below.
 
 ## Primary fix — delayed ChatGPT assistant image previews (Issue #25)
 
@@ -8,7 +8,7 @@ When the ChatGPT interface initially shows a loading indicator instead of a resp
 
 This change is based on [PR #27](https://github.com/AliAmini93/ChatFolio/pull/27), merged to main as `0b030bac83104c24c6d1efd518a026f6c5bb09fa`. Stable v1.9.0 itself was not modified.
 
-## Validation available before the version bump
+## Validation
 
 - GitHub Actions and isolated Ubuntu QA: **85/85 Node tests and 39/39 real Chromium fixtures** passed on the exact implementation SHA `9190bc623ccbf20303c449cb8f514caf3f95e301`. Bundle, syntax, deterministic ZIP gate passed.
 - Three foreground, real ChatGPT runs of the **same 122-message** conversation: **29/29** unique groups, **14** confident rich assistants, 100% group coverage. `scanImageRecaptures` was **4, 0 and 2** across the runs.
@@ -21,9 +21,17 @@ This change is based on [PR #27](https://github.com/AliAmini93/ChatFolio/pull/27
 - The 22-case manual QA acceptance matrix covering ChatGPT, Claude and Gemini remains **incomplete**. Do not claim unrun tests passed.
 - Raw UI representation for unmatched assistant messages is subject to previously disclosed API/DOM matching limitations; `apiRawRich` does not equal the count of confidently matched rich responses.
 
-## Prior to any public v1.9.1 Release
+## Release verification and artifact
 
-1. Verify the **version-bumped** candidate commit on GitHub Actions and Ubuntu (unit tests, Chromium browser tests, release integrity, reproducible ZIP).
-2. Inspect and record the final artifact size and **actual SHA-256**. Never reuse the v1.9.0 asset hash for the new patch.
-3. Retain the explicit known limitations and obtain separate maintainer approval for any outstanding manual-QA release exceptions.
-4. Only after those gates create an annotated `v1.9.1` tag and attach the exact verified `chatfolio-1.9.1-chrome.zip` asset. No user conversations, PDFs, images or authentication data may be included.
+- Version-bumped release candidate `4a16eeb4a78ba2372ed850d2ec27620c21ecc31d`: GitHub Actions run `39574140240` and independent Ubuntu run both PASS (**85 Node unit tests, 39 Chromium browser tests**, bundle/check/build, reproducible 12-file ZIP).
+- Approved distributable: `chatfolio-1.9.1-chrome.zip` — **116,068 bytes**.
+- Approved SHA-256: `6f80980e7f32ab650965bc14f4d4c23b3e929f3806a4fdb2941e3bbefc5bccf2`.
+- The final tagged source includes only documentation changes since the fully tested merged code. The publication workflow repeats validation and checks byte-identical ZIP hashes **before** creating the annotated tag or the GitHub Release.
+
+## Installation
+
+Download the ZIP asset from this official GitHub Release, verify the SHA-256 above, extract into a permanent folder and load it through Chrome `chrome://extensions` → Developer mode → Load unpacked. Disable duplicate older unpacked copies to avoid using the wrong version. Keep the source ChatGPT tab foreground during historical rich export.
+
+## Accepted release exceptions
+
+On **2026-10-21**, the maintainer explicitly authorized publishing Stable v1.9.1 with the uncompleted 22-scenario real-provider QA matrix and out-of-scope assistant preview hydration edge cases **clearly disclosed**. This does not turn unfinished tests into PASS and does not guarantee pixel-perfect archival output. No user conversations, PDFs, image content or authentication data are included in the repository or public ZIP.
