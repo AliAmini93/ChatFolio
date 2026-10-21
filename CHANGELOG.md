@@ -1,3 +1,12 @@
+## v1.9.1 - ChatGPT delayed assistant image preview stabilization (release preparation)
+
+- Guard historical ChatGPT Rich UI captures against asynchronously loading assistant preview images: if visible media evidence improves while the same identity-matched assistant remains mounted, at most two protected snapshot upgrades are allowed.
+- Never replace a stored result with fewer image tags; exclude tiny citation favicon loading from image upgrade signals, without additional remote network waits.
+- Add a real Chromium regression that changes a loading placeholder into an embedded PNG and verifies the resulting PDF, table fidelity, conversation order and restoration.
+- Three real foreground ChatGPT exports, all from a 122-turn conversation, reached 29/29 groups, 14 confident rich assistants, 74 PDF pages, 57 clickable links, and 15 image placements. Image contents/pages and hyperlink targets matched the previous approved baseline. Live recapture counts were 4, 0 and 2 across the three runs.
+- **Limitations:** fix is scoped to images hydrating while matched content remains mounted; it does not guarantee previews hydrating only after unmount or external print-iframe failures. The full 22-scenario cross-provider live QA matrix is still incomplete. Keep ChatGPT tab visible during export.
+- **Release status:** this is a staged development version bump, not a public tag or Release. Previous stable v1.9.0 remains available.
+
 ## v1.9.0 - Stabilized refactoring release (2026-10-20)
 
 - Integrate modular provider architecture, stronger media and print security, long-conversation recovery, deterministic build verification and Release Gate.
