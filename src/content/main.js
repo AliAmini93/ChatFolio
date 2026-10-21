@@ -1022,6 +1022,40 @@
     const rawRich = message => /<(?:grid|box|row|CodeBlock|Link|Chart|carousel|card)(?:\s|>)/i
       .test(String(message?.text || ""));
     const snapshots = new Map();
+    // Images can hydrate after the first snapshot while the SAME, already
+    // identity-matched assistant is still mounted in a virtualized window.
+    // Upgrade an earlier snapshot only when visible image evidence improves.
+    const imageQualityByIndex = new Map();
+    const imageUpgradeCounts = new Map();
+    const MAX_IMAGE_UPGRADES_PER_TURN = 2;
+    const liveAssistantImageQuality = node => {
+      const authored = ADAPTER.findTurn(node) || node;
+      let visible = 0, loaded = 0, pending = 0;
+      for (const image of authored.querySelectorAll("img")) {
+        const rect = image.getBoundingClientRect();
+        // Exclude decorative 16-32px citation favicons from re-capture
+        // decisions; they can fail to load independently of the response.
+        if (rect.width < 64 || rect.height < 40) continue;
+        visible++;
+        if (image.complete && image.naturalWidth >= 24 && image.naturalHeight >= 24) {
+          loaded++;
+        } else {
+          pending++;
+        }
+      }
+      // The real provider may render a placeholder *instead of* an img.
+      // These generic accessibility/loading hooks are hints only; they
+      // never authorize assigning the snapshot to a different API turn.
+      pending += authored.querySelectorAll(
+        '[aria-busy="true"], [role="progressbar"], [class*="animate-spin"], [data-state="loading"]'
+      ).length;
+      return { visible, loaded, pending };
+    };
+    const richerImageState = (next, prior) =>
+      next.loaded > prior.loaded ||
+      (next.visible > prior.visible && next.loaded >= prior.loaded) ||
+      (next.pending < prior.pending &&
+        next.loaded >= prior.loaded && next.visible >= prior.visible);
     const visitedGroupIds = new Set();
     let previousFirstGroupKey = "";
     const observedAssistantGroups = new Set();
@@ -1062,6 +1096,8 @@
       scanSerializeMs: 0,
       scanMaxSerializeMs: 0,
       scanSerializeAttempts: 0,
+      scanImagePendingSnapshots: 0,
+      scanImageRecaptures: 0,
       scanObservedAssistantGroups: 0,
       scanMatchedAssistantGroups: 0,
       scanUnmatchedAssistantGroups: 0,
@@ -1124,7 +1160,13 @@
       diagnostics.scanMatchingMs += matchingMs;
       diagnostics.scanMaxMatchingMs = Math.max(diagnostics.scanMaxMatchingMs, matchingMs);
       for (const [index, node] of pairs) {
-        if (snapshots.has(index)) continue;
+        const previous = imageQualityByIndex.get(index);
+        const hasSnapshot = snapshots.has(index);
+        const currentImageQuality = liveAssistantImageQuality(node);
+        if (hasSnapshot && (
+            (imageUpgradeCounts.get(index) || 0) >= MAX_IMAGE_UPGRADES_PER_TURN ||
+            !previous || !richerImageState(currentImageQuality, previous)
+        )) continue;
         const original = originals[index];
         if (original?.role !== "assistant") continue;
         // Do not replace authenticated API-only media with a partial
@@ -1154,7 +1196,18 @@
             diagnostics.skippedShortLiveText++;
             continue;
           }
+          if (hasSnapshot) {
+            // Keep a previously valid rich snapshot if a new image or
+            // provider cleanup path would drop previously captured images.
+            const imageTags = html => (String(html || "").match(/<img\b/gi) || []).length;
+            if (imageTags(rendered.html) < imageTags(snapshots.get(index)?.html)) continue;
+            diagnostics.scanImageRecaptures++;
+            imageUpgradeCounts.set(index, (imageUpgradeCounts.get(index) || 0) + 1);
+          } else if (currentImageQuality.pending > 0) {
+            diagnostics.scanImagePendingSnapshots++;
+          }
           snapshots.set(index, rendered);
+          imageQualityByIndex.set(index, currentImageQuality);
           const key = node.closest?.("[data-turn-key]")?.getAttribute?.("data-turn-key");
           if (key) matchedAssistantGroups.add(key);
         } catch (error) {
