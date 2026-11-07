@@ -1,6 +1,6 @@
 {
   "name": "chatfolio",
-  "version": "1.9.1",
+  "version": "1.9.2",
   "private": true,
   "description": "Developer commands and provider-neutral domain contracts for ChatFolio",
   "scripts": {

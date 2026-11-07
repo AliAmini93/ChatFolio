@@ -1,3 +1,12 @@
+## v1.9.2 - RTL A4 print clipping fix (release preparation; 2026-11-07)
+
+- Fix scaled A4 native Chromium printing of right-to-left long conversations: use left-to-right coordinates for the physical printed page while retaining RTL direction for Persian text, message cards, headings and tables.
+- Add a synthetic Chromium regression covering A4 print at 100% and 67% scale, checking text bounds, rich tables and clickable links.
+- Verified on a private real 311-page Persian/English conversation PDF: zero out-of-page text, image, link and drawing bounds. Old defective PDF had 130 pages with at least one off-page word. The old/new exports differ in source conversation state, so no byte-for-byte content equivalence is claimed.
+- GitHub Actions and independent Ubuntu QA on implementation commit `33b12a5`: 85 Node tests, 40 Chromium tests, deterministic bundle, syntax/build and ZIP integrity checks all passed. Implementation was merged in PR #30 as `04f01f9`.
+- Synchronize extension version in Manifest, package, npm lockfile and popup fallback. The popup normally reads the running extension version via `chrome.runtime.getManifest().version`.
+- **Not a public release yet:** this version bump and these notes are staged for review. The last official stable/tag remains v1.9.1; keep private PDF content out of GitHub. The incomplete cross-provider manual QA and delayed-image edge-case disclosures remain applicable.
+
 ## v1.9.1 - ChatGPT delayed assistant image preview stabilization (2026-10-21)
 
 - Guard historical ChatGPT Rich UI captures against asynchronously loading assistant preview images: if visible media evidence improves while the same identity-matched assistant remains mounted, at most two protected snapshot upgrades are allowed.
