@@ -7168,6 +7168,13 @@ function createPdfDocumentRenderer({
     }
 
     @media print {
+      /* Chromium can translate a right-to-left physical page to negative X
+         when the user picks a non-default print scale. Use LTR only for the
+         paginated page coordinate system; authored messages, header and
+         tables retain their independent RTL direction declarations. */
+      html[dir="rtl"], html[dir="rtl"] body {
+        direction: ltr !important;
+      }
       html, body, main {
         min-height: 0 !important;
         height: auto !important;
